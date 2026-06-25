@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+
+# Backtrace / debug output
+*.pdb
+
+# Local WAL / data files produced at runtime
+*.wal
+/data
+
+# Editor / OS noise
+*.swp
+.DS_Store
+.idea/
+.vscode/
+.claude/

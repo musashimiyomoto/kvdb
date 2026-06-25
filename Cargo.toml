@@ -1,0 +1,31 @@
+[package]
+name = "kvdb"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kvdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvdb-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "kvdb-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["typed-header"] }
+# Plain HTTP only — no TLS stack needed, keeps the build and image lean.
+reqwest = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# Drive the axum router directly in tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+opt-level = 3

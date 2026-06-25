@@ -1,0 +1,16 @@
+# Keep the build context small and the image cache clean.
+/target
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+
+# Runtime data must never leak into the image.
+*.wal
+/data
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
