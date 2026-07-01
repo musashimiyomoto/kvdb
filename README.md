@@ -66,6 +66,26 @@ KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
 # optional: kvdb-server <BIND_ADDR> <WAL_PATH>
 ```
 
+### Logging
+
+The server logs to **stderr** and, if `KVDB_LOG_FILE` is set, also appends to
+that file. The minimum level is controlled by `KVDB_LOG` (`error`, `warn`,
+`info` (default), `debug`):
+
+```sh
+KVDB_LOG=debug KVDB_LOG_FILE=kvdb.log \
+KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
+# [2026-07-01T12:00:00Z INFO  kvdb::server] listening on 0.0.0.0:6380
+```
+
+### Storage layout
+
+Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
+(`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
+order. When the memtable grows past `KVDB_MEMTABLE_LIMIT` entries (default
+`1024`) it is flushed to a new SSTable, the manifest is updated, and the WAL is
+truncated. Reads consult the memtable first, then SSTables newest-to-oldest.
+
 ### Talk to it with curl
 
 ```sh
@@ -122,8 +142,14 @@ runs as a non-root user.
 
 - [x] memtable + WAL + recovery
 - [x] HTTP/REST API with Basic auth
-- [ ] flush the memtable into sorted **SSTables** once it crosses a threshold
-- [ ] SSTable lookups + block index
-- [ ] **compaction** — merge SSTables, drop tombstones
+- [x] logging to console **and** file (no external crates)
+- [x] represent deletes as **tombstones** in the memtable — a delete must leave a
+  trace so it can shadow an older on-disk value instead of resurrecting it
+- [x] flush the memtable into an immutable sorted **SSTable** once it crosses a
+  threshold; seal (truncate) the WAL and record the file in a **manifest**
+- [x] read path: memtable → newest-to-oldest SSTables, first hit (incl. tombstone) wins
+- [ ] SSTable **block index** + sparse index (today each SSTable loads a dense
+  in-memory key→offset index on open)
+- [ ] **compaction** — k-way merge SSTables, drop shadowed entries and tombstones
 - [ ] **bloom filters** to skip files that can't contain a key
-- [ ] batches / transactions / MVCC
+- [ ] sequence numbers → batches / transactions / MVCC

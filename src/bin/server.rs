@@ -14,14 +14,19 @@ use std::process::ExitCode;
 
 use kvdb::http::{AppState, router};
 use kvdb::store::Store;
+use kvdb::{log_error, log_info};
 use tokio::net::TcpListener;
+
+const TARGET: &str = "kvdb::server";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the logger before anything else so startup is observable.
+    kvdb::log::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kvdb: {e}");
+            log_error!(TARGET, "fatal: {e}");
             ExitCode::FAILURE
         }
     }
@@ -37,8 +42,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let password = require_env("KVDB_PASSWORD")?;
 
     let store = Store::open(&wal_path)?;
-    println!(
-        "kvdb: recovered {} key(s) from {}",
+    log_info!(
+        TARGET,
+        "recovered {} key(s) from {}",
         store.len(),
         store.wal_path().display()
     );
@@ -47,7 +53,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;
-    println!("kvdb: HTTP listening on {bind_addr}");
+    log_info!(TARGET, "listening on {bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
