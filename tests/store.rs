@@ -19,7 +19,7 @@ fn set_get_delete() {
     let mut s = Store::open(&path).unwrap();
     s.set(b"a".to_vec(), b"1".to_vec()).unwrap();
     assert_eq!(s.get(b"a"), Some(b"1".to_vec()));
-    assert_eq!(s.delete(b"a").unwrap(), true);
+    assert!(s.delete(b"a").unwrap());
     assert_eq!(s.get(b"a"), None);
     std::fs::remove_file(&path).unwrap();
 }

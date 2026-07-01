@@ -70,7 +70,7 @@ async fn repl(client: &Client, cfg: &Config) -> std::process::ExitCode {
     loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
-            Ok(None) => break,            // EOF (Ctrl-D)
+            Ok(None) => break, // EOF (Ctrl-D)
             Err(e) => {
                 eprintln!("input error: {e}");
                 break;
@@ -103,7 +103,8 @@ async fn run_command(client: &Client, cfg: &Config, parts: &[String]) -> Result<
     let cmd = parts.first().ok_or("empty command")?.to_uppercase();
     match cmd.as_str() {
         "PING" => {
-            let (status, body) = request(client, cfg, reqwest::Method::GET, "/health", None).await?;
+            let (status, body) =
+                request(client, cfg, reqwest::Method::GET, "/health", None).await?;
             report(status, &body, "PONG");
             Ok(())
         }
@@ -129,8 +130,7 @@ async fn run_command(client: &Client, cfg: &Config, parts: &[String]) -> Result<
         "DEL" | "DELETE" => {
             let key = parts.get(1).ok_or("usage: DEL <key>")?;
             let path = key_path(key);
-            let (status, body) =
-                request(client, cfg, reqwest::Method::DELETE, &path, None).await?;
+            let (status, body) = request(client, cfg, reqwest::Method::DELETE, &path, None).await?;
             report(status, &body, "OK");
             Ok(())
         }

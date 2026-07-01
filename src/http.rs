@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -86,11 +86,7 @@ async fn get_key(State(state): State<AppState>, Path(key): Path<String>) -> Resp
 }
 
 /// `PUT /v1/keys/{key}` — stores the request body as the value.
-async fn put_key(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    body: Bytes,
-) -> Response {
+async fn put_key(State(state): State<AppState>, Path(key): Path<String>, body: Bytes) -> Response {
     let mut store = match state.store.lock() {
         Ok(g) => g,
         Err(_) => return lock_error(),
@@ -159,11 +155,7 @@ fn unauthorized() -> Response {
 
 /// `500` used when the shared store mutex is poisoned by a prior panic.
 fn lock_error() -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "store lock poisoned\n",
-    )
-        .into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned\n").into_response()
 }
 
 /// Compares two byte slices without short-circuiting on the first difference.

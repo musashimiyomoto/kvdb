@@ -12,7 +12,7 @@
 
 use std::process::ExitCode;
 
-use kvdb::http::{router, AppState};
+use kvdb::http::{AppState, router};
 use kvdb::store::Store;
 use tokio::net::TcpListener;
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use kvdb::http::{router, AppState};
+use kvdb::http::{AppState, router};
 use kvdb::store::Store;
 use tower::ServiceExt; // for `oneshot`
 
@@ -31,7 +31,10 @@ fn state(tag: &str) -> (AppState, PathBuf) {
 
 /// Encodes `user:pass` into a Basic auth header value.
 fn basic(user: &str, pass: &str) -> String {
-    format!("Basic {}", base64_encode(format!("{user}:{pass}").as_bytes()))
+    format!(
+        "Basic {}",
+        base64_encode(format!("{user}:{pass}").as_bytes())
+    )
 }
 
 /// Sends one request against a fresh router cloned from `state`.
@@ -109,8 +112,7 @@ async fn put_get_delete_roundtrip() {
 
 /// Minimal standard base64 encoder (no padding shortcuts), for test auth headers.
 fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
