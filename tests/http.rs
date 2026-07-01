@@ -110,6 +110,77 @@ async fn put_get_delete_roundtrip() {
     std::fs::remove_file(&path).ok();
 }
 
+#[tokio::test]
+async fn empty_body_stores_empty_value() {
+    let (st, path) = state("empty-body");
+    let auth = basic(USER, PASS);
+
+    let (status, _) = send(&st, "PUT", "/v1/keys/blank", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The key now exists with an empty value: 200 with an empty body, not 404.
+    let (status, body) = send(&st, "GET", "/v1/keys/blank", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "");
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn percent_encoded_key_roundtrips() {
+    let (st, path) = state("pct-key");
+    let auth = basic(USER, PASS);
+
+    // Key "a/b c" arrives percent-encoded in the path and must be decoded to the
+    // same bytes for storage and retrieval.
+    let (status, _) = send(&st, "PUT", "/v1/keys/a%2Fb%20c", Some(&auth), "val").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(&st, "GET", "/v1/keys/a%2Fb%20c", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "val");
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn delete_absent_key_returns_404() {
+    let (st, path) = state("http-del-absent");
+    let auth = basic(USER, PASS);
+
+    let (status, _) = send(&st, "DELETE", "/v1/keys/ghost", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn unsupported_method_is_405() {
+    let (st, path) = state("http-405");
+    let auth = basic(USER, PASS);
+
+    // POST is not wired up for the key route; axum answers 405 for a known path
+    // with an unknown method (auth still required, but a valid header passes it).
+    let (status, _) = send(&st, "POST", "/v1/keys/x", Some(&auth), "y").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn large_body_roundtrips_over_http() {
+    let (st, path) = state("http-large");
+    let auth = basic(USER, PASS);
+
+    let big = "x".repeat(512 * 1024); // 512 KiB
+    let (status, _) = send(&st, "PUT", "/v1/keys/blob", Some(&auth), &big).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(&st, "GET", "/v1/keys/blob", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), big.len());
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// Minimal standard base64 encoder (no padding shortcuts), for test auth headers.
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -54,8 +54,15 @@ Clients authenticate with HTTP Basic auth (`curl -u user:pass`, or the
 
 ```sh
 cargo build --release
-cargo test           # storage engine + HTTP router tests
+cargo test           # fast suite: storage engine + HTTP router tests
+
+# Heavier suites are opt-in (kept out of the default run):
+cargo test --release --test load -- --ignored              # stress / concurrency
+cargo test --release --test perf -- --ignored --nocapture  # throughput numbers
 ```
+
+CI builds the Docker image and smoke-tests the running container on every push,
+so the primary (containerized) way of running kvdb is exercised end-to-end.
 
 ## Run
 

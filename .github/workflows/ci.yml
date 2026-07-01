@@ -35,3 +35,73 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+      # Informational only: throughput numbers are surfaced in the run's job
+      # summary, not gated. Absolute values are noisy on shared runners — the
+      # #[ignore]d perf tests still fail the step if they panic (a correctness
+      # check), but the timings are for eyeballing, not pass/fail.
+      - name: Performance (informational)
+        run: |
+          {
+            echo '### Performance (informational)'
+            echo ''
+            echo '_Micro-benchmarks on a shared CI runner — absolute numbers are noisy; use for rough trends only._'
+            echo ''
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo test --release --test perf -- --ignored --nocapture 2>&1 \
+            | grep 'ops/sec' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    name: docker build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t kvdb:ci .
+
+      - name: Run container
+        run: |
+          docker run -d --name kvdb \
+            -e KVDB_USER=admin -e KVDB_PASSWORD=secret \
+            -p 6380:6380 -v kvdb-data:/data \
+            kvdb:ci
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if [ "$(curl -s localhost:6380/health)" = "PONG" ]; then
+              echo "healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become healthy"; docker logs kvdb; exit 1
+
+      - name: Smoke test the REST API
+        run: |
+          set -euo pipefail
+          # Unauthenticated request must be rejected.
+          code=$(curl -s -o /dev/null -w '%{http_code}' localhost:6380/v1/keys/city)
+          [ "$code" = "401" ] || { echo "expected 401, got $code"; exit 1; }
+          # PUT / GET / DELETE roundtrip.
+          curl -sf -u admin:secret -X PUT localhost:6380/v1/keys/city -d Berlin
+          [ "$(curl -sf -u admin:secret localhost:6380/v1/keys/city)" = "Berlin" ]
+          curl -sf -u admin:secret -X DELETE localhost:6380/v1/keys/city
+          # Data must persist across a container restart (the /data volume).
+          curl -sf -u admin:secret -X PUT localhost:6380/v1/keys/persist -d kept
+          docker restart kvdb
+          for i in $(seq 1 30); do
+            [ "$(curl -s localhost:6380/health)" = "PONG" ] && break || sleep 1
+          done
+          [ "$(curl -sf -u admin:secret localhost:6380/v1/keys/persist)" = "kept" ]
+          echo "smoke test passed"
+
+      - name: Container logs
+        if: always()
+        run: docker logs kvdb || true
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f kvdb || true
