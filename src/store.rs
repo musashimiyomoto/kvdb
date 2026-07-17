@@ -228,6 +228,71 @@ impl Store {
         Ok(())
     }
 
+    /// Merges every live SSTable into one table, retaining only the newest
+    /// record for each key and dropping tombstones. Tombstones are safe to drop
+    /// because this is a full compaction: there are no older tables left that
+    /// could otherwise resurrect their values.
+    ///
+    /// Publication follows the same crash-safe order as [`Self::flush`]: write
+    /// and fsync the replacement table, atomically publish its manifest, then
+    /// remove superseded files. A crash before the manifest update leaves the
+    /// old set live; a crash after it leaves harmless orphaned old files.
+    pub fn compact(&mut self) -> io::Result<()> {
+        if self.sstables.is_empty() {
+            return Ok(());
+        }
+
+        let merged = merge_sstables(&self.sstables)?;
+        let old_names = self.sstable_names();
+        let dir = parent_dir(&self.wal_path);
+        let manifest = manifest_path(&self.wal_path);
+
+        let replacement = if merged.is_empty() {
+            None
+        } else {
+            let name = sstable_name(&self.wal_path, self.next_seq);
+            let path = dir.join(&name);
+            SsTable::write(
+                &path,
+                merged.iter().map(|(key, value)| (key.as_slice(), value)),
+            )?;
+            let table = SsTable::open(&path)?;
+            Some((name, table))
+        };
+
+        let replacement_names: Vec<String> = replacement
+            .as_ref()
+            .map(|(name, _)| vec![name.clone()])
+            .unwrap_or_default();
+        write_manifest(&manifest, &replacement_names)?;
+
+        let replacement_name = replacement.as_ref().map(|(name, _)| name.as_str());
+        for old_name in &old_names {
+            if Some(old_name.as_str()) == replacement_name {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_file(dir.join(old_name)) {
+                log_warn!(
+                    TARGET,
+                    "could not remove superseded SSTable {old_name}: {e}"
+                );
+            }
+        }
+
+        self.sstables = replacement.into_iter().map(|(_, table)| table).collect();
+        if !self.sstables.is_empty() {
+            self.next_seq += 1;
+        }
+
+        log_info!(
+            TARGET,
+            "compacted {} SSTable(s) into {} table(s)",
+            old_names.len(),
+            self.sstables.len()
+        );
+        Ok(())
+    }
+
     /// Empties the WAL file after its contents have been captured in an SSTable.
     /// The buffer is flushed first, then the file is truncated to zero length;
     /// the append handle keeps writing new records from the (now empty) start.
@@ -253,14 +318,18 @@ impl Store {
 
     /// Number of live keys currently visible across every level.
     ///
-    /// This walks the union of keys (memtable + SSTable indexes) and counts
-    /// those resolving to a live value — O(keys), used for the startup summary
-    /// and tests rather than a hot path.
+    /// This walks the union of keys (memtable + on-disk SSTable scans) and counts
+    /// those resolving to a live value -- O(keys), used for the startup summary
+    /// and tests rather than a hot path. SSTables deliberately keep only sparse
+    /// block indexes in memory.
     pub fn len(&self) -> usize {
         let mut keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
-            keys.extend(sst.keys().cloned());
+            match sst.keys() {
+                Ok(sstable_keys) => keys.extend(sstable_keys),
+                Err(e) => log_warn!(TARGET, "sstable key scan failed: {e}"),
+            }
         }
         keys.iter()
             .filter(|k| matches!(self.lookup(k), Some(Value::Set(_))))
@@ -295,6 +364,46 @@ impl Store {
     pub fn manifest_path(&self) -> PathBuf {
         manifest_path(&self.wal_path)
     }
+}
+
+/// K-way merge sorted SSTables, oldest to newest. When more than one source
+/// has the same key, the last source wins; tombstones are omitted because a
+/// full compaction leaves no older level for them to shadow.
+fn merge_sstables(sstables: &[SsTable]) -> io::Result<Vec<(Vec<u8>, Value)>> {
+    let sources: Vec<Vec<(Vec<u8>, Value)>> = sstables
+        .iter()
+        .map(SsTable::entries)
+        .collect::<io::Result<_>>()?;
+    let mut positions = vec![0usize; sources.len()];
+    let mut merged = Vec::new();
+
+    while let Some((_, key)) = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(source, entries)| {
+            entries.get(positions[source]).map(|(key, _)| (source, key))
+        })
+        .min_by(|(_, left), (_, right)| left.cmp(right))
+    {
+        let key = key.clone();
+        let mut newest = None;
+
+        for (source, entries) in sources.iter().enumerate() {
+            if entries
+                .get(positions[source])
+                .is_some_and(|(candidate, _)| candidate == &key)
+            {
+                newest = Some(entries[positions[source]].1.clone());
+                positions[source] += 1;
+            }
+        }
+
+        if let Some(Value::Set(value)) = newest {
+            merged.push((key, Value::Set(value)));
+        }
+    }
+
+    Ok(merged)
 }
 
 // ---- Paths -----------------------------------------------------------------

@@ -320,6 +320,107 @@ fn many_keys_across_many_flushes_all_recover() {
 }
 
 #[test]
+fn sparse_index_reads_large_sstable_after_reopen() {
+    let dir = tmp_dir("sparse-index");
+    let wal = dir.join("kvdb.wal");
+
+    const N: usize = 150; // spans three 64-record SSTable blocks
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set_memtable_limit(usize::MAX);
+        for i in 0..N {
+            s.set(
+                format!("key-{i:04}").into_bytes(),
+                format!("value-{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        s.flush().unwrap();
+    }
+
+    let s = Store::open(&wal).unwrap();
+    for i in [0, 63, 64, 127, 128, N - 1] {
+        assert_eq!(
+            s.get(format!("key-{i:04}").as_bytes()),
+            Some(format!("value-{i}").into_bytes())
+        );
+    }
+    assert_eq!(s.get(b"key-0063x"), None);
+    assert_eq!(s.len(), N);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compaction_keeps_newest_values_and_discards_tombstones() {
+    let dir = tmp_dir("compact");
+    let wal = dir.join("kvdb.wal");
+
+    let mut s = Store::open(&wal).unwrap();
+    s.set(b"updated".to_vec(), b"old".to_vec()).unwrap();
+    s.set(b"deleted".to_vec(), b"present".to_vec()).unwrap();
+    s.set(b"stable".to_vec(), b"kept".to_vec()).unwrap();
+    s.flush().unwrap();
+
+    s.set(b"updated".to_vec(), b"new".to_vec()).unwrap();
+    assert!(s.delete(b"deleted").unwrap());
+    s.set(b"added".to_vec(), b"fresh".to_vec()).unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.sstable_count(), 2);
+
+    s.compact().unwrap();
+    assert_eq!(s.sstable_count(), 1);
+    assert_eq!(s.get(b"updated"), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"deleted"), None);
+    assert_eq!(s.get(b"stable"), Some(b"kept".to_vec()));
+    assert_eq!(s.get(b"added"), Some(b"fresh".to_vec()));
+    assert_eq!(s.len(), 3);
+
+    // The compacted table survives a restart, and subsequent flushes preserve
+    // its sequence naming and read precedence.
+    s.set(b"later".to_vec(), b"tail".to_vec()).unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.sstable_count(), 2);
+    drop(s);
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.get(b"updated"), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"deleted"), None);
+    assert_eq!(s.get(b"later"), Some(b"tail".to_vec()));
+    assert_eq!(s.len(), 4);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compaction_of_only_tombstones_publishes_an_empty_manifest() {
+    let dir = tmp_dir("compact-empty");
+    let wal = dir.join("kvdb.wal");
+
+    let mut s = Store::open(&wal).unwrap();
+    s.set(b"gone".to_vec(), b"value".to_vec()).unwrap();
+    s.flush().unwrap();
+    assert!(s.delete(b"gone").unwrap());
+    s.flush().unwrap();
+
+    s.compact().unwrap();
+    assert_eq!(s.sstable_count(), 0);
+    assert_eq!(s.get(b"gone"), None);
+    assert!(
+        std::fs::read_to_string(s.manifest_path())
+            .unwrap()
+            .is_empty()
+    );
+    drop(s);
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.sstable_count(), 0);
+    assert_eq!(s.get(b"gone"), None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn unknown_wal_opcode_is_a_hard_error() {
     let path = tmp_path("bad-opcode");
     // A single byte 0x07 is not a valid op code; recovery must refuse it

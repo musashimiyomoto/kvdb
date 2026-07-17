@@ -91,7 +91,13 @@ Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
 (`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
 order. When the memtable grows past `KVDB_MEMTABLE_LIMIT` entries (default
 `1024`) it is flushed to a new SSTable, the manifest is updated, and the WAL is
-truncated. Reads consult the memtable first, then SSTables newest-to-oldest.
+truncated. Each new SSTable stores records in 64-entry blocks with a persisted
+**sparse index** (one first-key + byte range per block) and a **Bloom filter**.
+Opening a table does not load every key into memory; a Bloom negative skips the
+file entirely, while a possible hit binary-searches the index and scans one
+block. Calling `Store::compact()` fully merges the live SSTables, retains only
+the newest value for each key, drops tombstones, and atomically replaces the
+manifest.
 
 ### Talk to it with curl
 
@@ -155,8 +161,10 @@ runs as a non-root user.
 - [x] flush the memtable into an immutable sorted **SSTable** once it crosses a
   threshold; seal (truncate) the WAL and record the file in a **manifest**
 - [x] read path: memtable → newest-to-oldest SSTables, first hit (incl. tombstone) wins
-- [ ] SSTable **block index** + sparse index (today each SSTable loads a dense
-  in-memory key→offset index on open)
-- [ ] **compaction** — k-way merge SSTables, drop shadowed entries and tombstones
-- [ ] **bloom filters** to skip files that can't contain a key
+- [x] SSTable **block index** + persisted sparse index (64 records per block;
+  one first-key + byte range per block stays resident in memory)
+- [x] **compaction** — full k-way merge of SSTables; drop shadowed entries and
+  tombstones, then atomically publish the replacement manifest
+- [x] **bloom filters** persisted with each new SSTable to skip files that
+  definitely cannot contain a key (false positives still use the normal lookup)
 - [ ] sequence numbers → batches / transactions / MVCC
