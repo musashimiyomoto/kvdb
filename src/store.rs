@@ -25,11 +25,80 @@ use crate::{log_debug, log_info, log_warn};
 /// WAL operation codes.
 const OP_SET: u8 = 1;
 const OP_DELETE: u8 = 2;
+const OP_BATCH: u8 = 3;
 
 /// Default memtable size (live + tombstone entries) that triggers a flush.
 const DEFAULT_MEMTABLE_LIMIT: usize = 1024;
 
 const TARGET: &str = "kvdb::store";
+
+/// One mutation inside an atomic [`WriteBatch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchOperation {
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// A group of mutations committed as one WAL record and one sequence number.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteBatch {
+    operations: Vec<BatchOperation>,
+}
+
+/// An immutable, read-only copy of the store's visible state at one sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    sequence: u64,
+    values: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl Snapshot {
+    /// Returns the value visible when this snapshot was created.
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.values.get(key).map(Vec::as_slice)
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.values.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Commit sequence captured by this snapshot.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl WriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> &mut Self {
+        self.operations.push(BatchOperation::Set { key, value });
+        self
+    }
+
+    pub fn delete(&mut self, key: Vec<u8>) -> &mut Self {
+        self.operations.push(BatchOperation::Delete { key });
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
 
 /// A single-node, crash-safe key-value store: WAL + memtable + SSTables.
 pub struct Store {
@@ -43,6 +112,10 @@ pub struct Store {
     sstables: Vec<SsTable>,
     /// Sequence number for the next SSTable file.
     next_seq: u64,
+    /// Sequence number of the latest committed mutation or batch.
+    sequence: u64,
+    /// Latest sequence already represented by the manifest's SSTables.
+    durable_sequence: u64,
     /// Flush the memtable once it reaches this many entries.
     memtable_limit: usize,
 }
@@ -56,7 +129,8 @@ impl Store {
 
         // 1. Load previously-flushed SSTables from the manifest.
         let manifest_path = manifest_path(&wal_path);
-        let sstable_names = read_manifest(&manifest_path)?;
+        let manifest = read_manifest(&manifest_path)?;
+        let sstable_names = manifest.sstables;
         let dir = parent_dir(&wal_path);
         let mut sstables = Vec::with_capacity(sstable_names.len());
         for name in &sstable_names {
@@ -66,7 +140,7 @@ impl Store {
         let next_seq = next_seq_from(&sstable_names);
 
         // 2. Replay the WAL (writes since the last flush) on top of the SSTables.
-        let memtable = Self::replay(&wal_path)?;
+        let (memtable, sequence) = Self::replay(&wal_path, manifest.sequence)?;
 
         // 3. Reopen the WAL in append mode for subsequent writes.
         let file = OpenOptions::new()
@@ -87,6 +161,8 @@ impl Store {
             wal_path,
             sstables,
             next_seq,
+            sequence,
+            durable_sequence: manifest.sequence,
             memtable_limit: memtable_limit_from_env(),
         })
     }
@@ -96,23 +172,29 @@ impl Store {
     /// A truncated trailing record (e.g. from a crash mid-write) is treated as
     /// "not committed" and silently dropped, rather than failing recovery. A
     /// DELETE replays as a tombstone so it still shadows any older SSTable value.
-    fn replay(path: &Path) -> io::Result<BTreeMap<Vec<u8>, Value>> {
+    fn replay(path: &Path, durable_sequence: u64) -> io::Result<(BTreeMap<Vec<u8>, Value>, u64)> {
         let mut map = BTreeMap::new();
+        let mut sequence = durable_sequence;
 
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(map),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((map, sequence)),
             Err(e) => return Err(e),
         };
         let mut reader = BufReader::new(file);
 
         loop {
             match read_record(&mut reader) {
-                Ok(Some(Record::Set { key, value })) => {
-                    map.insert(key, Value::Set(value));
+                Ok(Some(record)) if record.sequence() <= durable_sequence => continue,
+                Ok(Some(record)) if record.sequence() <= sequence => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL sequence numbers are not strictly increasing",
+                    ));
                 }
-                Ok(Some(Record::Delete { key })) => {
-                    map.insert(key, Value::Tombstone);
+                Ok(Some(record)) => {
+                    sequence = record.sequence();
+                    record.apply_to(&mut map);
                 }
                 Ok(None) => break, // clean end of log
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // torn tail write
@@ -120,7 +202,7 @@ impl Store {
             }
         }
 
-        Ok(map)
+        Ok((map, sequence))
     }
 
     /// Returns the value for `key`, if present and not deleted.
@@ -134,29 +216,38 @@ impl Store {
     /// Resolves a key across every level, newest to oldest, returning the first
     /// record found (which may be a tombstone). `None` means no level knows it.
     fn lookup(&self, key: &[u8]) -> Option<Value> {
+        match self.lookup_result(key) {
+            Ok(value) => value,
+            Err(e) => {
+                log_warn!(TARGET, "sstable read failed for a key: {e}");
+                None
+            }
+        }
+    }
+
+    fn lookup_result(&self, key: &[u8]) -> io::Result<Option<Value>> {
         // Memtable is newest.
         if let Some(v) = self.memtable.get(key) {
-            return Some(v.clone());
+            return Ok(Some(v.clone()));
         }
         // Then SSTables, newest (last pushed) first.
         for sst in self.sstables.iter().rev() {
             match sst.get(key) {
-                Ok(Some(v)) => return Some(v),
+                Ok(Some(v)) => return Ok(Some(v)),
                 Ok(None) => continue,
-                Err(e) => {
-                    log_warn!(TARGET, "sstable read failed for a key: {e}");
-                    continue;
-                }
+                Err(e) => return Err(e),
             }
         }
-        None
+        Ok(None)
     }
 
     /// Inserts or overwrites `key` with `value`, durably. May trigger a flush.
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-        write_set(&mut self.wal, &key, &value)?;
+        let sequence = self.next_sequence()?;
+        write_set(&mut self.wal, sequence, &key, &value)?;
         self.wal.flush()?;
         self.memtable.insert(key, Value::Set(value));
+        self.sequence = sequence;
         self.maybe_flush()
     }
 
@@ -167,11 +258,38 @@ impl Store {
         // Existed = there is a live value at some level right now.
         let existed = matches!(self.lookup(key), Some(Value::Set(_)));
 
-        write_delete(&mut self.wal, key)?;
+        let sequence = self.next_sequence()?;
+        write_delete(&mut self.wal, sequence, key)?;
         self.wal.flush()?;
         self.memtable.insert(key.to_vec(), Value::Tombstone);
+        self.sequence = sequence;
         self.maybe_flush()?;
         Ok(existed)
+    }
+
+    /// Commits all operations atomically as one WAL record. Recovery applies
+    /// either the complete batch or none of it if the trailing record is torn.
+    /// Operations are applied in order, so the last operation for a key wins.
+    pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<u64> {
+        if batch.is_empty() {
+            return Ok(self.sequence);
+        }
+
+        let sequence = self.next_sequence()?;
+        write_batch(&mut self.wal, sequence, &batch.operations)?;
+        self.wal.flush()?;
+        for operation in batch.operations {
+            apply_operation(&mut self.memtable, operation);
+        }
+        self.sequence = sequence;
+        self.maybe_flush()?;
+        Ok(sequence)
+    }
+
+    fn next_sequence(&self) -> io::Result<u64> {
+        self.sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("commit sequence exhausted"))
     }
 
     /// Flushes the memtable to a new SSTable if it has reached the limit.
@@ -208,7 +326,8 @@ impl Store {
         // 2. Publish it by appending to the manifest (temp + fsync + rename).
         let mut names: Vec<String> = self.sstable_names();
         names.push(name.clone());
-        write_manifest(&manifest_path(&self.wal_path), &names)?;
+        write_manifest(&manifest_path(&self.wal_path), self.sequence, &names)?;
+        self.durable_sequence = self.sequence;
 
         // 3. Seal the WAL: everything in it is now durable in the SSTable.
         self.truncate_wal()?;
@@ -264,7 +383,7 @@ impl Store {
             .as_ref()
             .map(|(name, _)| vec![name.clone()])
             .unwrap_or_default();
-        write_manifest(&manifest, &replacement_names)?;
+        write_manifest(&manifest, self.durable_sequence, &replacement_names)?;
 
         let replacement_name = replacement.as_ref().map(|(name, _)| name.as_str());
         for old_name in &old_names {
@@ -353,6 +472,32 @@ impl Store {
     /// Number of SSTables currently live (flushed and recorded in the manifest).
     pub fn sstable_count(&self) -> usize {
         self.sstables.len()
+    }
+
+    /// Sequence number of the latest committed mutation or atomic batch.
+    pub fn current_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Captures all currently visible live values in an immutable read-only
+    /// snapshot. Later writes, flushes, and compactions do not change it.
+    pub fn snapshot(&self) -> io::Result<Snapshot> {
+        let mut keys = std::collections::BTreeSet::new();
+        keys.extend(self.memtable.keys().cloned());
+        for sst in &self.sstables {
+            keys.extend(sst.keys()?);
+        }
+
+        let mut values = BTreeMap::new();
+        for key in keys {
+            if let Some(Value::Set(value)) = self.lookup_result(&key)? {
+                values.insert(key, value);
+            }
+        }
+        Ok(Snapshot {
+            sequence: self.sequence,
+            values,
+        })
     }
 
     /// Path to the backing WAL file.
@@ -453,36 +598,63 @@ fn seq_of(name: &str) -> Option<u64> {
 
 // ---- Manifest --------------------------------------------------------------
 
-/// Reads the manifest: one SSTable file name per line, oldest first. A missing
-/// manifest means a fresh store (no SSTables yet).
-fn read_manifest(path: &Path) -> io::Result<Vec<String>> {
+#[derive(Default)]
+struct Manifest {
+    sequence: u64,
+    sstables: Vec<String>,
+}
+
+/// Reads the manifest: `sequence=<u64>` metadata plus one SSTable file name per
+/// line, oldest first. A missing manifest means a fresh store.
+fn read_manifest(path: &Path) -> io::Result<Manifest> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Manifest::default()),
         Err(e) => return Err(e),
     };
-    let mut names = Vec::new();
+    let mut manifest = Manifest::default();
+    let mut saw_sequence = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
         let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            names.push(trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(raw_sequence) = trimmed.strip_prefix("sequence=") {
+            if saw_sequence {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest contains more than one sequence",
+                ));
+            }
+            manifest.sequence = raw_sequence.parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid manifest sequence")
+            })?;
+            saw_sequence = true;
+        } else {
+            manifest.sstables.push(trimmed.to_string());
         }
     }
-    Ok(names)
+    if !saw_sequence {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest is missing its sequence",
+        ));
+    }
+    Ok(manifest)
 }
 
 /// Writes the manifest atomically (temp file + fsync + rename) so a crash never
 /// leaves a partially-written catalog of live SSTables.
-fn write_manifest(path: &Path, names: &[String]) -> io::Result<()> {
+fn write_manifest(path: &Path, sequence: u64, names: &[String]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
 
     let mut file = File::create(&tmp)?;
+    writeln!(file, "sequence={sequence}")?;
     for name in names {
-        file.write_all(name.as_bytes())?;
-        file.write_all(b"\n")?;
+        writeln!(file, "{name}")?;
     }
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
@@ -493,25 +665,100 @@ fn write_manifest(path: &Path, names: &[String]) -> io::Result<()> {
 
 /// A decoded WAL record.
 enum Record {
-    Set { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+    Set {
+        sequence: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        sequence: u64,
+        key: Vec<u8>,
+    },
+    Batch {
+        sequence: u64,
+        operations: Vec<BatchOperation>,
+    },
 }
 
-/// Encodes and appends a SET record: `[OP_SET][key_len][key][val_len][value]`.
-fn write_set<W: Write>(w: &mut W, key: &[u8], value: &[u8]) -> io::Result<()> {
+impl Record {
+    fn sequence(&self) -> u64 {
+        match self {
+            Record::Set { sequence, .. }
+            | Record::Delete { sequence, .. }
+            | Record::Batch { sequence, .. } => *sequence,
+        }
+    }
+
+    fn apply_to(self, map: &mut BTreeMap<Vec<u8>, Value>) {
+        match self {
+            Record::Set { key, value, .. } => {
+                map.insert(key, Value::Set(value));
+            }
+            Record::Delete { key, .. } => {
+                map.insert(key, Value::Tombstone);
+            }
+            Record::Batch { operations, .. } => {
+                for operation in operations {
+                    apply_operation(map, operation);
+                }
+            }
+        }
+    }
+}
+
+fn apply_operation(map: &mut BTreeMap<Vec<u8>, Value>, operation: BatchOperation) {
+    match operation {
+        BatchOperation::Set { key, value } => {
+            map.insert(key, Value::Set(value));
+        }
+        BatchOperation::Delete { key } => {
+            map.insert(key, Value::Tombstone);
+        }
+    }
+}
+
+/// Encodes a SET record: `[OP_SET][sequence][key_len][key][val_len][value]`.
+fn write_set<W: Write>(w: &mut W, sequence: u64, key: &[u8], value: &[u8]) -> io::Result<()> {
     w.write_all(&[OP_SET])?;
-    w.write_all(&(key.len() as u32).to_be_bytes())?;
-    w.write_all(key)?;
-    w.write_all(&(value.len() as u32).to_be_bytes())?;
-    w.write_all(value)?;
+    w.write_all(&sequence.to_be_bytes())?;
+    write_chunk(w, key)?;
+    write_chunk(w, value)?;
     Ok(())
 }
 
-/// Encodes and appends a DELETE record: `[OP_DELETE][key_len][key]`.
-fn write_delete<W: Write>(w: &mut W, key: &[u8]) -> io::Result<()> {
+/// Encodes a DELETE record: `[OP_DELETE][sequence][key_len][key]`.
+fn write_delete<W: Write>(w: &mut W, sequence: u64, key: &[u8]) -> io::Result<()> {
     w.write_all(&[OP_DELETE])?;
-    w.write_all(&(key.len() as u32).to_be_bytes())?;
-    w.write_all(key)?;
+    w.write_all(&sequence.to_be_bytes())?;
+    write_chunk(w, key)?;
+    Ok(())
+}
+
+/// Encodes all operations into one WAL record, making the batch atomic during
+/// replay because no mutation is applied until the complete record is decoded.
+fn write_batch<W: Write>(
+    w: &mut W,
+    sequence: u64,
+    operations: &[BatchOperation],
+) -> io::Result<()> {
+    let count = u32::try_from(operations.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "batch is too large"))?;
+    w.write_all(&[OP_BATCH])?;
+    w.write_all(&sequence.to_be_bytes())?;
+    w.write_all(&count.to_be_bytes())?;
+    for operation in operations {
+        match operation {
+            BatchOperation::Set { key, value } => {
+                w.write_all(&[OP_SET])?;
+                write_chunk(w, key)?;
+                write_chunk(w, value)?;
+            }
+            BatchOperation::Delete { key } => {
+                w.write_all(&[OP_DELETE])?;
+                write_chunk(w, key)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -526,13 +773,31 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
 
     match op[0] {
         OP_SET => {
+            let sequence = read_sequence(r)?;
             let key = read_chunk(r)?;
             let value = read_chunk(r)?;
-            Ok(Some(Record::Set { key, value }))
+            Ok(Some(Record::Set {
+                sequence,
+                key,
+                value,
+            }))
         }
         OP_DELETE => {
+            let sequence = read_sequence(r)?;
             let key = read_chunk(r)?;
-            Ok(Some(Record::Delete { key }))
+            Ok(Some(Record::Delete { sequence, key }))
+        }
+        OP_BATCH => {
+            let sequence = read_sequence(r)?;
+            let count = read_u32(r)? as usize;
+            let mut operations = Vec::new();
+            for _ in 0..count {
+                operations.push(read_batch_operation(r)?);
+            }
+            Ok(Some(Record::Batch {
+                sequence,
+                operations,
+            }))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -541,14 +806,64 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     }
 }
 
+fn read_batch_operation<R: Read>(r: &mut R) -> io::Result<BatchOperation> {
+    match read_u8(r)? {
+        OP_SET => Ok(BatchOperation::Set {
+            key: read_chunk(r)?,
+            value: read_chunk(r)?,
+        }),
+        OP_DELETE => Ok(BatchOperation::Delete {
+            key: read_chunk(r)?,
+        }),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown WAL batch operation: {other}"),
+        )),
+    }
+}
+
+fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WAL field is too large"))?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(bytes)
+}
+
 /// Reads a length-prefixed byte chunk (`[u32 len][bytes]`).
 fn read_chunk<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let len = read_u32(r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    r.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    r.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    r.read_exact(&mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn read_sequence<R: Read>(r: &mut R) -> io::Result<u64> {
+    let sequence = read_u64(r)?;
+    if sequence == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL sequence must be greater than zero",
+        ));
+    }
+    Ok(sequence)
 }
 
 // ---- Config ----------------------------------------------------------------

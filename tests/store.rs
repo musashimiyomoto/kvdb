@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use kvdb::store::Store;
+use kvdb::store::{Store, WriteBatch};
 
 /// Returns a fresh, unique temp WAL path and removes any leftover from a
 /// previous run with the same tag.
@@ -406,16 +406,167 @@ fn compaction_of_only_tombstones_publishes_an_empty_manifest() {
     s.compact().unwrap();
     assert_eq!(s.sstable_count(), 0);
     assert_eq!(s.get(b"gone"), None);
-    assert!(
-        std::fs::read_to_string(s.manifest_path())
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        std::fs::read_to_string(s.manifest_path()).unwrap(),
+        format!("sequence={}\n", s.current_sequence())
     );
     drop(s);
 
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.sstable_count(), 0);
     assert_eq!(s.get(b"gone"), None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn atomic_batch_applies_in_order_with_one_sequence_number() {
+    let path = tmp_path("batch");
+    let mut s = Store::open(&path).unwrap();
+    let mut batch = WriteBatch::new();
+    batch
+        .set(b"a".to_vec(), b"first".to_vec())
+        .set(b"b".to_vec(), b"second".to_vec())
+        .delete(b"a".to_vec())
+        .set(b"a".to_vec(), b"last".to_vec());
+
+    assert_eq!(s.write_batch(batch).unwrap(), 1);
+    assert_eq!(s.current_sequence(), 1);
+    assert_eq!(s.get(b"a"), Some(b"last".to_vec()));
+    assert_eq!(s.get(b"b"), Some(b"second".to_vec()));
+
+    // An empty batch is a no-op and does not consume a sequence number.
+    assert_eq!(s.write_batch(WriteBatch::new()).unwrap(), 1);
+    assert_eq!(s.current_sequence(), 1);
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.current_sequence(), 1);
+    assert_eq!(s.get(b"a"), Some(b"last".to_vec()));
+    assert_eq!(s.get(b"b"), Some(b"second".to_vec()));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn torn_batch_is_discarded_without_partial_application() {
+    let path = tmp_path("batch-torn");
+    {
+        let mut s = Store::open(&path).unwrap();
+        let mut batch = WriteBatch::new();
+        batch
+            .set(b"a".to_vec(), b"one".to_vec())
+            .set(b"b".to_vec(), b"two".to_vec());
+        s.write_batch(batch).unwrap();
+    }
+
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    file.set_len(len - 1).unwrap();
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.current_sequence(), 0);
+    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"b"), None);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn sequence_survives_flush_and_duplicate_wal_replay() {
+    let dir = tmp_dir("sequence");
+    let wal = dir.join("kvdb.wal");
+
+    let wal_before_flush = {
+        let mut s = Store::open(&wal).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.set(b"persisted".to_vec(), b"value".to_vec());
+        assert_eq!(s.write_batch(batch).unwrap(), 1);
+        let wal_bytes = std::fs::read(&wal).unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.current_sequence(), 1);
+        wal_bytes
+    };
+
+    // Simulate a crash after publishing the manifest but before truncating the
+    // WAL. The duplicate sequence is already durable in the SSTable and skipped.
+    std::fs::write(&wal, wal_before_flush).unwrap();
+    let mut s = Store::open(&wal).unwrap();
+    assert_eq!(s.current_sequence(), 1);
+    assert_eq!(s.get(b"persisted"), Some(b"value".to_vec()));
+    s.set(b"next".to_vec(), b"two".to_vec()).unwrap();
+    assert_eq!(s.current_sequence(), 2);
+
+    drop(s);
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.get(b"next"), Some(b"two".to_vec()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compaction_does_not_mark_unflushed_wal_as_durable() {
+    let dir = tmp_dir("compact-wal-tail");
+    let wal = dir.join("kvdb.wal");
+
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set(b"flushed".to_vec(), b"sstable".to_vec()).unwrap();
+        s.flush().unwrap();
+        s.set(b"pending".to_vec(), b"wal".to_vec()).unwrap();
+        assert_eq!(s.current_sequence(), 2);
+        s.compact().unwrap();
+    }
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.get(b"flushed"), Some(b"sstable".to_vec()));
+    assert_eq!(s.get(b"pending"), Some(b"wal".to_vec()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn snapshot_remains_stable_after_writes_flush_and_compaction() {
+    let dir = tmp_dir("snapshot");
+    let wal = dir.join("kvdb.wal");
+
+    let mut s = Store::open(&wal).unwrap();
+    s.set(b"changing".to_vec(), b"old".to_vec()).unwrap();
+    s.set(b"kept".to_vec(), b"visible".to_vec()).unwrap();
+    s.set(b"gone".to_vec(), b"temporary".to_vec()).unwrap();
+    assert!(s.delete(b"gone").unwrap());
+    s.flush().unwrap();
+
+    let snapshot = s.snapshot().unwrap();
+    assert_eq!(snapshot.sequence(), 4);
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(snapshot.get(b"changing"), Some(b"old".as_slice()));
+    assert_eq!(snapshot.get(b"kept"), Some(b"visible".as_slice()));
+    assert_eq!(snapshot.get(b"gone"), None);
+
+    s.set(b"changing".to_vec(), b"new".to_vec()).unwrap();
+    assert!(s.delete(b"kept").unwrap());
+    s.set(b"added".to_vec(), b"later".to_vec()).unwrap();
+    s.flush().unwrap();
+    s.compact().unwrap();
+
+    assert_eq!(snapshot.sequence(), 4);
+    assert_eq!(snapshot.get(b"changing"), Some(b"old".as_slice()));
+    assert_eq!(snapshot.get(b"kept"), Some(b"visible".as_slice()));
+    assert_eq!(snapshot.get(b"added"), None);
+
+    assert_eq!(s.get(b"changing"), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"kept"), None);
+    assert_eq!(s.get(b"added"), Some(b"later".to_vec()));
+
+    drop(s);
+    let s = Store::open(&wal).unwrap();
+    let current = s.snapshot().unwrap();
+    assert_eq!(current.sequence(), 7);
+    assert_eq!(current.get(b"changing"), Some(b"new".as_slice()));
+    assert_eq!(current.get(b"kept"), None);
+    assert_eq!(current.get(b"added"), Some(b"later".as_slice()));
 
     std::fs::remove_dir_all(&dir).ok();
 }

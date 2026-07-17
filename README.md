@@ -89,15 +89,41 @@ KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
 
 Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
 (`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
-order. When the memtable grows past `KVDB_MEMTABLE_LIMIT` entries (default
-`1024`) it is flushed to a new SSTable, the manifest is updated, and the WAL is
-truncated. Each new SSTable stores records in 64-entry blocks with a persisted
+order together with the latest durable commit sequence. When the memtable grows
+past `KVDB_MEMTABLE_LIMIT` entries (default `1024`) it is flushed to a new
+SSTable, the manifest is updated, and the WAL is truncated. Each new SSTable
+stores records in 64-entry blocks with a persisted
 **sparse index** (one first-key + byte range per block) and a **Bloom filter**.
 Opening a table does not load every key into memory; a Bloom negative skips the
 file entirely, while a possible hit binary-searches the index and scans one
 block. Calling `Store::compact()` fully merges the live SSTables, retains only
 the newest value for each key, drops tombstones, and atomically replaces the
 manifest.
+
+### Atomic batches
+
+Every standalone `SET`/`DELETE` receives a monotonically increasing commit
+sequence. Library users can group mutations into a `WriteBatch`; the whole
+batch is encoded as one WAL record and consumes one sequence number, so recovery
+applies either every operation or none of them if the trailing record is torn:
+
+```rust
+use kvdb::{Store, WriteBatch};
+
+let mut store = Store::open("kvdb.wal")?;
+let mut batch = WriteBatch::new();
+batch
+    .set(b"user:1".to_vec(), b"Alice".to_vec())
+    .delete(b"user:old".to_vec());
+let sequence = store.write_batch(batch)?;
+# Ok::<(), std::io::Error>(())
+```
+
+`Store::snapshot()` returns an immutable read-only copy of all currently visible
+values together with its commit sequence. Later writes, flushes, and compactions
+do not affect it. This first snapshot implementation deliberately copies the
+logical state, so creating one costs O(keys + values) memory; it does not yet
+retain multiple versions inside SSTables.
 
 ### Talk to it with curl
 
@@ -167,4 +193,6 @@ runs as a non-root user.
   tombstones, then atomically publish the replacement manifest
 - [x] **bloom filters** persisted with each new SSTable to skip files that
   definitely cannot contain a key (false positives still use the normal lookup)
-- [ ] sequence numbers → batches / transactions / MVCC
+- [x] durable **sequence numbers** + atomic WAL **write batches**
+- [x] immutable read-only **snapshots** at a fixed sequence (copy-on-snapshot)
+- [ ] write transactions / full MVCC with per-key versions

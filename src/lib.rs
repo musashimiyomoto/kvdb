@@ -12,4 +12,4 @@ pub mod sstable;
 pub mod store;
 
 pub use http::{AppState, router};
-pub use store::Store;
+pub use store::{BatchOperation, Snapshot, Store, WriteBatch};
