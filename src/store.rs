@@ -33,6 +33,8 @@ const DEFAULT_COMPACTION_THRESHOLD: usize = 8;
 
 const TARGET: &str = "kvdb::store";
 
+type MemTable = BTreeMap<Vec<u8>, Vec<VersionedValue>>;
+
 /// One mutation inside an atomic [`WriteBatch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchOperation {
@@ -199,7 +201,7 @@ impl WriteBatch {
 /// A single-node, crash-safe key-value store: WAL + memtable + SSTables.
 pub struct Store {
     /// Sorted in-memory view of the most recent mutations (since the last flush).
-    memtable: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    memtable: MemTable,
     /// Buffered append-only handle to the WAL file.
     wal: BufWriter<File>,
     /// Path of the WAL; also the anchor for SSTable / manifest paths.
@@ -212,6 +214,8 @@ pub struct Store {
     sequence: u64,
     /// Latest sequence already represented by the manifest's SSTables.
     durable_sequence: u64,
+    /// Oldest sequence for which historical reads remain complete.
+    history_start: u64,
     /// Last commit sequence for keys changed since this Store was opened.
     key_sequences: BTreeMap<Vec<u8>, u64>,
     /// Flush the memtable once it reaches this many entries.
@@ -263,6 +267,7 @@ impl Store {
             next_seq,
             sequence,
             durable_sequence: manifest.sequence,
+            history_start: manifest.history_start,
             key_sequences: BTreeMap::new(),
             memtable_limit: memtable_limit_from_env(),
             compaction_threshold: compaction_threshold_from_env(),
@@ -274,10 +279,7 @@ impl Store {
     /// A truncated trailing record (e.g. from a crash mid-write) is treated as
     /// "not committed" and silently dropped, rather than failing recovery. A
     /// DELETE replays as a tombstone so it still shadows any older SSTable value.
-    fn replay(
-        path: &Path,
-        durable_sequence: u64,
-    ) -> io::Result<(BTreeMap<Vec<u8>, Vec<VersionedValue>>, u64)> {
+    fn replay(path: &Path, durable_sequence: u64) -> io::Result<(MemTable, u64)> {
         let mut map = BTreeMap::new();
         let mut sequence = durable_sequence;
 
@@ -312,15 +314,22 @@ impl Store {
 
     /// Returns the value for `key`, if present and not deleted.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.get_at(key, u64::MAX)
+        match self.lookup(key) {
+            Some(Value::Set(value)) => Some(value),
+            _ => None,
+        }
     }
 
     /// Returns the value visible at `sequence`, if it existed and was live.
-    pub fn get_at(&self, key: &[u8], sequence: u64) -> Option<Vec<u8>> {
-        match self.lookup_at(key, sequence) {
-            Some(Value::Set(v)) => Some(v),
+    ///
+    /// Returns an error if the requested sequence predates retained history or
+    /// is newer than this Store. Use [`Self::get`] for the current value.
+    pub fn get_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<Vec<u8>>> {
+        self.validate_historical_sequence(sequence)?;
+        Ok(match self.lookup_at_result(key, sequence)? {
+            Some(Value::Set(value)) => Some(value),
             _ => None, // tombstone or genuinely absent
-        }
+        })
     }
 
     /// Resolves a key across every level, newest to oldest, returning the first
@@ -337,10 +346,6 @@ impl Store {
                 None
             }
         }
-    }
-
-    fn lookup_result(&self, key: &[u8]) -> io::Result<Option<Value>> {
-        self.lookup_at_result(key, u64::MAX)
     }
 
     fn lookup_at_result(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
@@ -456,7 +461,12 @@ impl Store {
         // 2. Publish it by appending to the manifest (temp + fsync + rename).
         let mut names: Vec<String> = self.sstable_names();
         names.push(name.clone());
-        write_manifest(&manifest_path(&self.wal_path), self.sequence, &names)?;
+        write_manifest(
+            &manifest_path(&self.wal_path),
+            self.sequence,
+            self.history_start,
+            &names,
+        )?;
         self.durable_sequence = self.sequence;
 
         // 3. Seal the WAL: everything in it is now durable in the SSTable.
@@ -487,21 +497,61 @@ impl Store {
         Ok(())
     }
 
-    /// Merges every live SSTable into one table, retaining only the newest
-    /// record for each key and dropping tombstones. Tombstones are safe to drop
-    /// because this is a full compaction: there are no older tables left that
-    /// could otherwise resurrect their values.
+    /// Merges every live SSTable into one table, retaining all ordered versions
+    /// of each key. Historical values and tombstones remain available to MVCC
+    /// reads; version garbage collection is a separate concern.
     ///
     /// Publication follows the same crash-safe order as [`Self::flush`]: write
     /// and fsync the replacement table, atomically publish its manifest, then
     /// remove superseded files. A crash before the manifest update leaves the
     /// old set live; a crash after it leaves harmless orphaned old files.
     pub fn compact(&mut self) -> io::Result<()> {
+        self.compact_sstables(self.history_start)
+    }
+
+    /// Flushes pending writes and compacts all versions while discarding
+    /// history older than `history_start`.
+    ///
+    /// For each key, the newest value at or before the boundary is retained as
+    /// an anchor so every snapshot from the boundary onward stays correct. An
+    /// anchor tombstone can be removed because a full compaction eliminates all
+    /// older tables it would otherwise need to shadow. The boundary is durable
+    /// and can only move forward.
+    pub fn compact_with_retention(&mut self, history_start: u64) -> io::Result<()> {
+        if history_start < self.history_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history retention boundary cannot move backwards",
+            ));
+        }
+        if history_start > self.sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history retention boundary is newer than the Store",
+            ));
+        }
+
+        // GC covers the whole Store. Flushing first ensures old versions do not
+        // remain in the WAL or memtable and reappear in a later SSTable.
+        self.flush()?;
+        self.compact_sstables(history_start)
+    }
+
+    fn compact_sstables(&mut self, history_start: u64) -> io::Result<()> {
         if self.sstables.is_empty() {
+            if history_start != self.history_start {
+                write_manifest(
+                    &manifest_path(&self.wal_path),
+                    self.durable_sequence,
+                    history_start,
+                    &[],
+                )?;
+            }
+            self.history_start = history_start;
             return Ok(());
         }
 
-        let merged = merge_sstables(&self.sstables)?;
+        let merged = retain_history_from(merge_sstables(&self.sstables)?, history_start);
         let old_names = self.sstable_names();
         let dir = parent_dir(&self.wal_path);
         let manifest = manifest_path(&self.wal_path);
@@ -525,7 +575,12 @@ impl Store {
             .as_ref()
             .map(|(name, _)| vec![name.clone()])
             .unwrap_or_default();
-        write_manifest(&manifest, self.durable_sequence, &replacement_names)?;
+        write_manifest(
+            &manifest,
+            self.durable_sequence,
+            history_start,
+            &replacement_names,
+        )?;
 
         let replacement_name = replacement.as_ref().map(|(name, _)| name.as_str());
         for old_name in &old_names {
@@ -541,6 +596,7 @@ impl Store {
         }
 
         self.sstables = replacement.into_iter().map(|(_, table)| table).collect();
+        self.history_start = history_start;
         if !self.sstables.is_empty() {
             self.next_seq += 1;
         }
@@ -630,9 +686,21 @@ impl Store {
         self.sequence
     }
 
+    /// Oldest sequence for which [`Self::get_at`] and [`Self::snapshot_at`]
+    /// can reconstruct a complete historical view.
+    pub fn history_start_sequence(&self) -> u64 {
+        self.history_start
+    }
+
     /// Captures all currently visible live values in an immutable read-only
     /// snapshot. Later writes, flushes, and compactions do not change it.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
+        self.snapshot_at(self.sequence)
+    }
+
+    /// Reconstructs an immutable snapshot at a historical commit sequence.
+    pub fn snapshot_at(&self, sequence: u64) -> io::Result<Snapshot> {
+        self.validate_historical_sequence(sequence)?;
         let mut keys = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
@@ -641,14 +709,30 @@ impl Store {
 
         let mut values = BTreeMap::new();
         for key in keys {
-            if let Some(Value::Set(value)) = self.lookup_result(&key)? {
+            if let Some(Value::Set(value)) = self.lookup_at_result(&key, sequence)? {
                 values.insert(key, value);
             }
         }
-        Ok(Snapshot {
-            sequence: self.sequence,
-            values,
-        })
+        Ok(Snapshot { sequence, values })
+    }
+
+    fn validate_historical_sequence(&self, sequence: u64) -> io::Result<()> {
+        if sequence < self.history_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "sequence {sequence} predates retained history starting at {}",
+                    self.history_start
+                ),
+            ));
+        }
+        if sequence > self.sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sequence is newer than the Store",
+            ));
+        }
+        Ok(())
     }
 
     /// Starts an optimistic transaction over a fixed read-only snapshot.
@@ -701,12 +785,9 @@ impl Store {
     }
 }
 
-/// K-way merge sorted SSTables, oldest to newest. When more than one source
-/// has the same key, the last source wins; tombstones are omitted because a
-/// full compaction leaves no older level for them to shadow.
-fn merge_sstables(
-    sstables: &[SsTable],
-) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
+/// K-way merge sorted SSTables, oldest to newest. All unique commit sequences
+/// are retained; if a sequence is duplicated, the newest source wins.
+fn merge_sstables(sstables: &[SsTable]) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
     let sources: Vec<Vec<(Vec<u8>, Vec<VersionedValue>)>> = sstables
         .iter()
         .map(SsTable::entries)
@@ -747,6 +828,30 @@ fn merge_sstables(
     }
 
     Ok(merged)
+}
+
+/// Applies a global history boundary to fully merged key histories.
+fn retain_history_from(
+    entries: Vec<(Vec<u8>, Vec<VersionedValue>)>,
+    history_start: u64,
+) -> Vec<(Vec<u8>, Vec<VersionedValue>)> {
+    entries
+        .into_iter()
+        .filter_map(|(key, versions)| {
+            let after_boundary =
+                versions.partition_point(|version| version.sequence <= history_start);
+            let keep_from = after_boundary.saturating_sub(1);
+            let mut retained = versions.into_iter().skip(keep_from).collect::<Vec<_>>();
+
+            if retained.first().is_some_and(|version| {
+                version.sequence <= history_start && version.value == Value::Tombstone
+            }) {
+                retained.remove(0);
+            }
+
+            (!retained.is_empty()).then_some((key, retained))
+        })
+        .collect()
 }
 
 // ---- Paths -----------------------------------------------------------------
@@ -799,11 +904,12 @@ fn seq_of(name: &str) -> Option<u64> {
 #[derive(Default)]
 struct Manifest {
     sequence: u64,
+    history_start: u64,
     sstables: Vec<String>,
 }
 
-/// Reads the manifest: `sequence=<u64>` metadata plus one SSTable file name per
-/// line, oldest first. A missing manifest means a fresh store.
+/// Reads the manifest metadata plus one SSTable file name per line, oldest
+/// first. A missing manifest means a fresh store.
 fn read_manifest(path: &Path) -> io::Result<Manifest> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -812,6 +918,7 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
     };
     let mut manifest = Manifest::default();
     let mut saw_sequence = false;
+    let mut saw_history_start = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
         let trimmed = line.trim();
@@ -829,6 +936,20 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid manifest sequence")
             })?;
             saw_sequence = true;
+        } else if let Some(raw_history_start) = trimmed.strip_prefix("history_start=") {
+            if saw_history_start {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest contains more than one history boundary",
+                ));
+            }
+            manifest.history_start = raw_history_start.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid manifest history boundary",
+                )
+            })?;
+            saw_history_start = true;
         } else {
             manifest.sstables.push(trimmed.to_string());
         }
@@ -839,18 +960,36 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
             "manifest is missing its sequence",
         ));
     }
+    if !saw_history_start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest is missing its history boundary",
+        ));
+    }
+    if manifest.history_start > manifest.sequence {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest history boundary is newer than its sequence",
+        ));
+    }
     Ok(manifest)
 }
 
 /// Writes the manifest atomically (temp file + fsync + rename) so a crash never
 /// leaves a partially-written catalog of live SSTables.
-fn write_manifest(path: &Path, sequence: u64, names: &[String]) -> io::Result<()> {
+fn write_manifest(
+    path: &Path,
+    sequence: u64,
+    history_start: u64,
+    names: &[String],
+) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
 
     let mut file = File::create(&tmp)?;
     writeln!(file, "sequence={sequence}")?;
+    writeln!(file, "history_start={history_start}")?;
     for name in names {
         writeln!(file, "{name}")?;
     }
@@ -887,7 +1026,7 @@ impl Record {
         }
     }
 
-    fn apply_to(self, map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>) {
+    fn apply_to(self, map: &mut MemTable) {
         match self {
             Record::Set {
                 sequence,
@@ -911,11 +1050,7 @@ impl Record {
     }
 }
 
-fn apply_operation(
-    map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-    sequence: u64,
-    operation: BatchOperation,
-) {
+fn apply_operation(map: &mut MemTable, sequence: u64, operation: BatchOperation) {
     match operation {
         BatchOperation::Set { key, value } => {
             insert_version(map, key, sequence, Value::Set(value));
@@ -926,12 +1061,7 @@ fn apply_operation(
     }
 }
 
-fn insert_version(
-    map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-    key: Vec<u8>,
-    sequence: u64,
-    value: Value,
-) {
+fn insert_version(map: &mut MemTable, key: Vec<u8>, sequence: u64, value: Value) {
     let versions = map.entry(key).or_default();
     if let Some(last) = versions.last_mut()
         && last.sequence == sequence

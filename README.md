@@ -89,18 +89,22 @@ KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
 
 Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
 (`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
-order together with the latest durable commit sequence. When the memtable grows
-past `KVDB_MEMTABLE_LIMIT` entries (default `1024`) it is flushed to a new
-SSTable, the manifest is updated, and the WAL is truncated. Each new SSTable
-stores records in 64-entry blocks with a persisted
+order together with the latest durable commit sequence and retained-history
+boundary. When the memtable grows past `KVDB_MEMTABLE_LIMIT` entries (default
+`1024`) it is flushed to a new SSTable, the manifest is updated, and the WAL is
+truncated. Each key record
+contains its versions in ascending commit-sequence order. SSTables group those
+records into 64-entry blocks with a persisted
 **sparse index** (one first-key + byte range per block) and a **Bloom filter**.
 Opening a table does not load every key into memory; a Bloom negative skips the
 file entirely, while a possible hit binary-searches the index and scans one
 block. Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the
-Store automatically performs a full compaction: it retains only the newest
-value for each key, drops tombstones, and atomically replaces the manifest.
-Setting the threshold to `0` disables automation; `Store::compact()` remains
-available for an explicit run.
+Store automatically performs a full compaction: it deduplicates identical
+commit sequences, preserves historical values and tombstones for MVCC, and
+atomically replaces the manifest. Setting the threshold to `0` disables
+automation; `Store::compact()` remains available for an explicit run.
+Automatic and ordinary manual compaction preserve every currently retained
+version.
 
 ### Atomic batches
 
@@ -122,10 +126,27 @@ let sequence = store.write_batch(batch)?;
 ```
 
 `Store::snapshot()` returns an immutable read-only copy of all currently visible
-values together with its commit sequence. Later writes, flushes, and compactions
-do not affect it. This first snapshot implementation deliberately copies the
-logical state, so creating one costs O(keys + values) memory; it does not yet
-retain multiple versions inside SSTables.
+values together with its commit sequence. `snapshot_at(sequence)` reconstructs
+the state at an older commit. Later writes, flushes, and compactions do not
+affect either snapshot. Creating one costs O(visible keys + values) memory; the
+underlying memtable and SSTables retain ordered per-key versions for historical
+reads.
+
+### History retention
+
+History is retained indefinitely by default. To reclaim old versions, call
+`compact_with_retention(history_start)`: it flushes pending writes, fully merges
+the SSTables, and retains exact reads and snapshots from `history_start` onward.
+The newest value at or before that sequence is kept as an anchor for each key;
+an obsolete tombstone is removed once no older SSTable can resurface behind it.
+The boundary is persisted in the manifest and can only advance. Historical
+`get_at` and `snapshot_at` calls before the boundary return `InvalidInput`
+rather than a partial answer.
+
+```rust
+store.compact_with_retention(10_000)?;
+assert_eq!(store.history_start_sequence(), 10_000);
+```
 
 `Store::begin_transaction()` builds on that snapshot with a private write
 overlay. Reads see the transaction's own SET/DELETE operations first. Commit is
@@ -198,8 +219,8 @@ runs as a non-root user.
 - [x] read path: memtable → newest-to-oldest SSTables, first hit (incl. tombstone) wins
 - [x] SSTable **block index** + persisted sparse index (64 records per block;
   one first-key + byte range per block stays resident in memory)
-- [x] **compaction** — full k-way merge of SSTables; drop shadowed entries and
-  tombstones, then atomically publish the replacement manifest
+- [x] **compaction** — full k-way merge of SSTables; combine duplicate version
+  histories and atomically publish the replacement manifest
 - [x] automatic compaction trigger by SSTable count (default `8`, configurable)
 - [x] **bloom filters** persisted with each new SSTable to skip files that
   definitely cannot contain a key (false positives still use the normal lookup)
@@ -207,4 +228,6 @@ runs as a non-root user.
 - [x] immutable read-only **snapshots** at a fixed sequence (copy-on-snapshot)
 - [x] optimistic **write transactions** with read-your-writes, atomic commit, and
   key-level read/write conflict detection
-- [ ] full MVCC with per-key versions and key-level conflict detection
+- [x] full MVCC storage with per-key versions and historical `get_at`/snapshots
+- [x] MVCC version garbage collection / retention policy (explicit durable
+  sequence boundary)

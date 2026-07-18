@@ -352,7 +352,7 @@ fn sparse_index_reads_large_sstable_after_reopen() {
 }
 
 #[test]
-fn compaction_keeps_newest_values_and_discards_tombstones() {
+fn compaction_keeps_current_values_and_historical_versions() {
     let dir = tmp_dir("compact");
     let wal = dir.join("kvdb.wal");
 
@@ -375,6 +375,10 @@ fn compaction_keeps_newest_values_and_discards_tombstones() {
     assert_eq!(s.get(b"stable"), Some(b"kept".to_vec()));
     assert_eq!(s.get(b"added"), Some(b"fresh".to_vec()));
     assert_eq!(s.len(), 3);
+    assert_eq!(s.get_at(b"updated", 1).unwrap(), Some(b"old".to_vec()));
+    assert_eq!(s.get_at(b"updated", 4).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get_at(b"deleted", 2).unwrap(), Some(b"present".to_vec()));
+    assert_eq!(s.get_at(b"deleted", 5).unwrap(), None);
 
     // The compacted table survives a restart, and subsequent flushes preserve
     // its sequence naming and read precedence.
@@ -388,12 +392,14 @@ fn compaction_keeps_newest_values_and_discards_tombstones() {
     assert_eq!(s.get(b"deleted"), None);
     assert_eq!(s.get(b"later"), Some(b"tail".to_vec()));
     assert_eq!(s.len(), 4);
+    assert_eq!(s.get_at(b"updated", 1).unwrap(), Some(b"old".to_vec()));
+    assert_eq!(s.get_at(b"deleted", 2).unwrap(), Some(b"present".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn compaction_of_only_tombstones_publishes_an_empty_manifest() {
+fn compaction_retains_history_behind_a_current_tombstone() {
     let dir = tmp_dir("compact-empty");
     let wal = dir.join("kvdb.wal");
 
@@ -404,17 +410,86 @@ fn compaction_of_only_tombstones_publishes_an_empty_manifest() {
     s.flush().unwrap();
 
     s.compact().unwrap();
-    assert_eq!(s.sstable_count(), 0);
+    assert_eq!(s.sstable_count(), 1);
     assert_eq!(s.get(b"gone"), None);
-    assert_eq!(
-        std::fs::read_to_string(s.manifest_path()).unwrap(),
-        format!("sequence={}\n", s.current_sequence())
-    );
+    assert_eq!(s.get_at(b"gone", 1).unwrap(), Some(b"value".to_vec()));
     drop(s);
 
     let s = Store::open(&wal).unwrap();
-    assert_eq!(s.sstable_count(), 0);
+    assert_eq!(s.sstable_count(), 1);
     assert_eq!(s.get(b"gone"), None);
+    assert_eq!(s.get_at(b"gone", 1).unwrap(), Some(b"value".to_vec()));
+    let historical = s.snapshot_at(1).unwrap();
+    assert_eq!(historical.sequence(), 1);
+    assert_eq!(historical.get(b"gone"), Some(b"value".as_slice()));
+    assert!(s.snapshot_at(3).is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compaction_retention_keeps_boundary_state_and_survives_reopen() {
+    let dir = tmp_dir("history-retention");
+    let wal = dir.join("kvdb.wal");
+
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set(b"unchanged".to_vec(), b"first".to_vec()).unwrap(); // 1
+        s.set(b"changed".to_vec(), b"old".to_vec()).unwrap(); // 2
+        s.delete(b"deleted").unwrap(); // 3
+        s.flush().unwrap();
+        s.set(b"changed".to_vec(), b"new".to_vec()).unwrap(); // 4
+        s.set(b"later".to_vec(), b"value".to_vec()).unwrap(); // 5
+
+        s.compact_with_retention(3).unwrap();
+        assert_eq!(s.history_start_sequence(), 3);
+        assert_eq!(s.get_at(b"changed", 3).unwrap(), Some(b"old".to_vec()));
+        assert_eq!(s.get_at(b"changed", 4).unwrap(), Some(b"new".to_vec()));
+        assert_eq!(s.get_at(b"unchanged", 3).unwrap(), Some(b"first".to_vec()));
+        assert_eq!(s.get_at(b"deleted", 3).unwrap(), None);
+        assert_eq!(s.get(b"deleted"), None);
+        assert_eq!(
+            s.get_at(b"changed", 2).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            s.snapshot_at(2).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(s.compact_with_retention(2).is_err());
+        assert!(s.compact_with_retention(6).is_err());
+    }
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.history_start_sequence(), 3);
+    assert_eq!(s.get_at(b"changed", 3).unwrap(), Some(b"old".to_vec()));
+    assert_eq!(s.get_at(b"changed", 4).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get_at(b"later", 5).unwrap(), Some(b"value".to_vec()));
+    assert!(s.get_at(b"unchanged", 2).is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn retention_boundary_persists_when_compaction_removes_every_key() {
+    let dir = tmp_dir("empty-history-retention");
+    let wal = dir.join("kvdb.wal");
+
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set(b"gone".to_vec(), b"value".to_vec()).unwrap();
+        s.delete(b"gone").unwrap();
+        s.compact_with_retention(2).unwrap();
+        assert_eq!(s.sstable_count(), 0);
+        assert_eq!(s.history_start_sequence(), 2);
+    }
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.sstable_count(), 0);
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.history_start_sequence(), 2);
+    assert!(s.snapshot_at(1).is_err());
+    assert!(s.is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -439,6 +514,7 @@ fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     s.set(b"d".to_vec(), b"four".to_vec()).unwrap();
     assert_eq!(s.sstable_count(), 1, "threshold triggers again");
     assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
     assert_eq!(s.get(b"b"), Some(b"two".to_vec()));
     assert_eq!(s.get(b"c"), Some(b"three".to_vec()));
     assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
@@ -448,6 +524,7 @@ fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     assert_eq!(s.sstable_count(), 1);
     assert_eq!(s.current_sequence(), 5);
     assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
     assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();

@@ -639,15 +639,25 @@ mod tests {
         p
     }
 
+    fn version(sequence: u64, value: Value) -> Vec<VersionedValue> {
+        vec![VersionedValue { sequence, value }]
+    }
+
     #[test]
     fn roundtrips_values_and_tombstones() {
         let path = tmp("roundtrip");
-        let entries: Vec<(Vec<u8>, Value)> = vec![
-            (b"a".to_vec(), Value::Set(b"1".to_vec())),
-            (b"b".to_vec(), Value::Tombstone),
-            (b"c".to_vec(), Value::Set(b"three".to_vec())),
+        let entries: Vec<(Vec<u8>, Vec<VersionedValue>)> = vec![
+            (b"a".to_vec(), version(1, Value::Set(b"1".to_vec()))),
+            (b"b".to_vec(), version(2, Value::Tombstone)),
+            (b"c".to_vec(), version(3, Value::Set(b"three".to_vec()))),
         ];
-        SsTable::write(&path, entries.iter().map(|(k, v)| (k.as_slice(), v))).unwrap();
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
+        )
+        .unwrap();
 
         let sst = SsTable::open(&path).unwrap();
         assert_eq!(sst.len(), 3);
@@ -666,19 +676,70 @@ mod tests {
     }
 
     #[test]
+    fn returns_the_version_visible_at_a_sequence() {
+        let path = tmp("versions");
+        let versions = vec![
+            VersionedValue {
+                sequence: 1,
+                value: Value::Set(b"old".to_vec()),
+            },
+            VersionedValue {
+                sequence: 2,
+                value: Value::Set(b"new".to_vec()),
+            },
+            VersionedValue {
+                sequence: 3,
+                value: Value::Tombstone,
+            },
+            VersionedValue {
+                sequence: 4,
+                value: Value::Set(b"revived".to_vec()),
+            },
+        ];
+        let entries = [(b"key".as_slice(), versions)];
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (*key, versions.as_slice())),
+        )
+        .unwrap();
+
+        let sst = SsTable::open(&path).unwrap();
+        assert_eq!(sst.get_at(b"key", 0).unwrap(), None);
+        assert_eq!(
+            sst.get_at(b"key", 1).unwrap(),
+            Some(Value::Set(b"old".to_vec()))
+        );
+        assert_eq!(
+            sst.get_at(b"key", 2).unwrap(),
+            Some(Value::Set(b"new".to_vec()))
+        );
+        assert_eq!(sst.get_at(b"key", 3).unwrap(), Some(Value::Tombstone));
+        assert_eq!(
+            sst.get_at(b"key", 4).unwrap(),
+            Some(Value::Set(b"revived".to_vec()))
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn bloom_filter_has_no_false_negatives_and_skips_a_data_block_on_miss() {
         let path = tmp("bloom");
-        let entries: Vec<(Vec<u8>, Value)> = (0..20)
+        let entries: Vec<(Vec<u8>, Vec<VersionedValue>)> = (0..20)
             .map(|i| {
                 (
                     format!("key-{i:04}").into_bytes(),
-                    Value::Set(format!("value-{i}").into_bytes()),
+                    version(i + 1, Value::Set(format!("value-{i}").into_bytes())),
                 )
             })
             .collect();
         SsTable::write(
             &path,
-            entries.iter().map(|(key, value)| (key.as_slice(), value)),
+            entries
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
         )
         .unwrap();
 
@@ -709,15 +770,21 @@ mod tests {
     #[test]
     fn sparse_index_finds_keys_at_block_boundaries() {
         let path = tmp("blocks");
-        let entries: Vec<(Vec<u8>, Value)> = (0..(RECORDS_PER_BLOCK * 2 + 5))
+        let entries: Vec<(Vec<u8>, Vec<VersionedValue>)> = (0..(RECORDS_PER_BLOCK * 2 + 5))
             .map(|i| {
                 (
                     format!("key-{i:04}").into_bytes(),
-                    Value::Set(format!("value-{i}").into_bytes()),
+                    version(i as u64 + 1, Value::Set(format!("value-{i}").into_bytes())),
                 )
             })
             .collect();
-        SsTable::write(&path, entries.iter().map(|(k, v)| (k.as_slice(), v))).unwrap();
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
+        )
+        .unwrap();
 
         let sst = SsTable::open(&path).unwrap();
         assert_eq!(sst.blocks.len(), 3);
@@ -739,10 +806,16 @@ mod tests {
     fn rejects_unsorted_entries() {
         let path = tmp("unsorted");
         let entries = [
-            (b"b".as_slice(), Value::Set(b"2".to_vec())),
-            (b"a".as_slice(), Value::Set(b"1".to_vec())),
+            (b"b".as_slice(), version(1, Value::Set(b"2".to_vec()))),
+            (b"a".as_slice(), version(2, Value::Set(b"1".to_vec()))),
         ];
-        let error = SsTable::write(&path, entries.iter().map(|(k, v)| (*k, v))).unwrap_err();
+        let error = SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (*key, versions.as_slice())),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         std::fs::remove_file(tmp_path(&path)).ok();
     }
