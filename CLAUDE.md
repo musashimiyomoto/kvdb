@@ -18,8 +18,8 @@ cargo clippy --all-targets          # lint
 cargo fmt                           # format
 
 # Heavy suites are #[ignore]d so the default run stays fast — opt in explicitly:
-cargo test --release --test load -- --ignored              # stress / concurrency correctness
-cargo test --release --test perf -- --ignored --nocapture  # informational throughput (prints ops/sec)
+cargo test --release --test load -- --ignored --nocapture --test-threads=1
+cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 
 # Build + smoke-test the Docker image the way CI does (see .github/workflows/ci.yml `docker` job)
 docker build -t kvdb .
@@ -55,11 +55,11 @@ Modules, layered bottom-up (`src/lib.rs` re-exports `Store`, `AppState`, `router
 Integration tests live in `tests/` (not unit tests in `src`). `tests/http.rs` exercises the real router through `oneshot` and includes hand-rolled base64 for the auth header. Tests create isolated WAL files via per-test `tmp_path(tag)` helpers, or a whole isolated directory via `tmp_dir(tag)` when a test flushes (SSTables + manifest are siblings of the WAL) — when adding tests, give each a unique tag so files don't collide.
 
 - `tests/store.rs`, `tests/http.rs` — the fast correctness suite (runs on `cargo test`).
-- `tests/load.rs` — stress / concurrency correctness (bulk insert + many flushes, concurrent HTTP writes through a shared `Arc<Mutex<Store>>`). Every test is `#[ignore]`d; run with `--test load -- --ignored`.
-- `tests/perf.rs` — a zero-dependency `Instant`-based micro-benchmark harness. Not pass/fail on timing (that would be flaky); it prints ops/sec and ns/op for set/get(memtable vs sstable vs miss)/flush/recovery. `#[ignore]`d; run with `--release --test perf -- --ignored --nocapture`.
+- `tests/load.rs` — stress correctness: bulk persistence, concurrent HTTP writes, deterministic mixed operations checked against a reference map, and volume MVCC/retention checks. Every test is `#[ignore]`d; run sequentially with the command above.
+- `tests/perf.rs` — a zero-dependency `Instant`-based benchmark harness covering WAL writes/batches/deletes, memtable/SSTable/historical reads, Bloom misses, flush, compaction, retention, recovery, snapshots, disk footprint, and the HTTP router. Timing is informational rather than pass/fail; run it sequentially to avoid benchmark interference.
 - Some `#[cfg(test)]` unit tests do live in `src` (`log.rs`, `sstable.rs`) for module-internal helpers that aren't reachable from integration tests.
 
-CI (`.github/workflows/ci.yml`) has two jobs: `ci` (fmt-check, clippy, release build, `cargo test`) and `docker` (builds the image, runs the container, and smoke-tests `/health` + a PUT/GET/DELETE roundtrip + persistence across a restart). The heavy `load`/`perf` suites are not run in CI by default.
+CI (`.github/workflows/ci.yml`) has four jobs: `ci` (fmt-check, clippy, release build, fast tests), `load` (sequential ignored release load tests), `performance` (sequential informational benchmarks with summary + artifact, no timing thresholds), and `docker` (image build plus `/health`, CRUD, and restart-persistence smoke tests).
 
 ## Conventions
 

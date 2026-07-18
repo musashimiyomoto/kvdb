@@ -495,6 +495,38 @@ fn retention_boundary_persists_when_compaction_removes_every_key() {
 }
 
 #[test]
+fn later_flush_and_automatic_compaction_preserve_retention_boundary() {
+    let dir = tmp_dir("retention-auto-compact");
+    let wal = dir.join("kvdb.wal");
+
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set_memtable_limit(usize::MAX);
+        s.set(b"key".to_vec(), b"v1".to_vec()).unwrap();
+        s.flush().unwrap();
+        s.set(b"key".to_vec(), b"v2".to_vec()).unwrap();
+        s.flush().unwrap();
+        s.compact_with_retention(2).unwrap();
+
+        s.set_compaction_threshold(2);
+        s.set_memtable_limit(1);
+        s.set(b"key".to_vec(), b"v3".to_vec()).unwrap();
+        assert_eq!(s.sstable_count(), 1);
+        assert_eq!(s.history_start_sequence(), 2);
+        assert_eq!(s.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(s.get(b"key"), Some(b"v3".to_vec()));
+        assert!(s.get_at(b"key", 1).is_err());
+    }
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.history_start_sequence(), 2);
+    assert_eq!(s.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(s.get(b"key"), Some(b"v3".to_vec()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     let dir = tmp_dir("compact-auto");
     let wal = dir.join("kvdb.wal");
@@ -803,6 +835,76 @@ fn transaction_read_conflict_detects_a_key_added_after_snapshot() {
     assert_eq!(s.get(b"derived"), None);
 
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn transaction_conflicts_when_a_read_value_changes_and_changes_back() {
+    let path = tmp_path("transaction-aba-conflict");
+    let mut s = Store::open(&path).unwrap();
+    s.set(b"key".to_vec(), b"original".to_vec()).unwrap();
+
+    let mut transaction = s.begin_transaction().unwrap();
+    assert_eq!(transaction.get(b"key"), Some(b"original".as_slice()));
+    transaction.set(b"derived".to_vec(), b"value".to_vec());
+
+    s.set(b"key".to_vec(), b"temporary".to_vec()).unwrap();
+    s.set(b"key".to_vec(), b"original".to_vec()).unwrap();
+    let error = s.commit_transaction(transaction).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::Conflict {
+            expected: 1,
+            actual: 3,
+            ..
+        }
+    ));
+    assert_eq!(s.get(b"derived"), None);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn manifest_rejects_history_boundary_newer_than_durable_sequence() {
+    let dir = tmp_dir("bad-history-boundary");
+    let wal = dir.join("kvdb.wal");
+    std::fs::write(dir.join("kvdb.manifest"), b"sequence=4\nhistory_start=5\n").unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected invalid history boundary to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn corrupted_live_sstable_is_rejected_on_reopen() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tmp_dir("corrupt-sstable");
+    let wal = dir.join("kvdb.wal");
+    {
+        let mut s = Store::open(&wal).unwrap();
+        s.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+        s.flush().unwrap();
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("kvdb-000000.sst"))
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(b"BROKEN!!").unwrap();
+    drop(file);
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected corrupted SSTable to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

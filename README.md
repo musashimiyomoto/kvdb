@@ -57,12 +57,79 @@ cargo build --release
 cargo test           # fast suite: storage engine + HTTP router tests
 
 # Heavier suites are opt-in (kept out of the default run):
-cargo test --release --test load -- --ignored              # stress / concurrency
-cargo test --release --test perf -- --ignored --nocapture  # throughput numbers
+cargo test --release --test load -- --ignored --nocapture --test-threads=1
+cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 ```
 
-CI builds the Docker image and smoke-tests the running container on every push,
-so the primary (containerized) way of running kvdb is exercised end-to-end.
+GitHub Actions runs formatting, Clippy, the fast suite, sequential release load
+tests, informational benchmarks, and a Docker persistence smoke test on every
+push to `master` and pull request. Load/performance logs are retained as build
+artifacts for 14 days; benchmark timings appear in the run summary but do not
+gate the build because shared-runner performance is noisy. The workflow can
+also be started manually with `workflow_dispatch`.
+
+## Load tests and performance baseline
+
+The ignored suites have different jobs. `tests/load.rs` asserts correctness
+under volume, concurrency, repeated reopen, compaction, and MVCC retention;
+timing never decides whether these tests pass. `tests/perf.rs` is an
+informational, dependency-free benchmark harness. Run both in release mode with
+one test thread as shown above so workloads do not compete with each other.
+
+Current load suite (all passed in `17.73 s` on the machine described below):
+
+| Scenario | Workload | What is verified |
+|---|---:|---|
+| Bulk persistence | 100k SET + 25k DELETE, ~100 flushes | Every value/tombstone after reopen with 90+ SSTables |
+| Concurrent HTTP | 200 distinct-key writers + 200 hot-key writers | No lost/corrupt writes; valid last-writer-wins result |
+| Deterministic mixed | 100k ops, 10k keys, 60% SET / 25% DELETE / 15% GET | Exact match with `BTreeMap` across periodic flush, compaction, and 10 reopens |
+| MVCC + retention | 30k commits over 2k keys + 4k historical probes | Historical reads before GC and retained reads after GC/reopen |
+
+### Local benchmark results
+
+Measured on 2026-07-18 under WSL2 (Linux 6.6), Intel Core i5-7200U
+(2 cores / 4 threads), 9.7 GiB RAM, Rust 1.97.1, release `opt-level=3`, with
+temporary files on the WSL filesystem. Values are the median of three complete
+sequential runs. Latency is total elapsed time divided by operation count; it
+is a mean, not a p95/p99. Setup/population is outside the measured interval.
+
+| Operation | Dataset | Median throughput | Mean latency |
+|---|---:|---:|---:|
+| SET, individual WAL record + flush | 200k | 180,815 ops/s | 5.531 us/op |
+| SET, atomic batches of 100 | 200k | 190,257 ops/s | 5.256 us/op |
+| DELETE, individual tombstone | 50k | 154,997 ops/s | 6.452 us/op |
+| GET, memtable hit | 100k | 1,869,809 ops/s | 0.535 us/op |
+| GET, one SSTable hit | 100k | 36,333 ops/s | 27.523 us/op |
+| GET miss, 10 Bloom checks | 100k | 245,046 ops/s | 4.081 us/op |
+| Historical `get_at`, 5-version SSTable | 20k | 14,424 ops/s | 69.330 us/op |
+| Flush memtable to one SSTable | 200k records | 610,572 records/s | 1.638 us/record |
+| Full compaction, 10 SSTables to 1 | 100k records | 344,617 records/s | 2.902 us/record |
+| Retention GC | 100k input versions | 720,612 versions/s | 1.388 us/version |
+| WAL recovery | 200k records | 855,672 records/s | 1.169 us/record |
+| Open one 200k-key SSTable | 1 table | - | 57.611 ms total |
+| Materialize copy-on-snapshot | 100k keys | 25,697 keys/s | 38.915 us/key |
+| HTTP GET through Axum router, no TCP | 50k requests | 181,014 req/s | 5.524 us/req |
+| HTTP PUT through Axum router, no TCP | 20k requests | 48,736 req/s | 20.519 us/req |
+
+The HTTP rows include routing, Basic auth, body handling, mutex locking, and the
+Store operation, but deliberately exclude socket/network overhead. WAL `flush`
+means flushing Rust's buffered writer to the OS; kvdb does not currently call
+`sync_data` for every mutation, so these numbers must not be read as fsync-level
+durability latency.
+
+Disk footprint from the same runs:
+
+| State | Bytes | Normalized size |
+|---|---:|---:|
+| WAL, 200k individual SET records | 9,488,890 | 47.4 B/record |
+| WAL, 200k SETs in batches of 100 | 7,914,890 | 39.6 B/record |
+| One 200k-key SSTable store | 10,651,487 | 53.3 B/record |
+| 100k distinct records before / after full compaction | 5,271,088 / 5,270,251 | 52.7 B/record |
+| 100k MVCC versions before / after retention | 4,926,142 / 1,534,140 | 68.9% reduction |
+
+These figures are a regression baseline for this machine, not an SLA. WSL2 I/O
+showed substantial run-to-run variance, which is why the table reports medians
+and keeps the exact reproduction command beside the results.
 
 ## Run
 
@@ -231,3 +298,6 @@ runs as a non-root user.
 - [x] full MVCC storage with per-key versions and historical `get_at`/snapshots
 - [x] MVCC version garbage collection / retention policy (explicit durable
   sequence boundary)
+- [x] deterministic mixed/MVCC **load tests** and corruption/transaction edge cases
+- [x] reproducible release **performance baseline** for storage, recovery,
+  compaction, disk footprint, and the HTTP router

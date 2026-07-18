@@ -10,6 +10,7 @@
 //! They assert *correctness under volume and concurrency*, not timing — the
 //! informational throughput numbers live in `tests/perf.rs`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use axum::body::Body;
@@ -126,6 +127,131 @@ async fn concurrent_http_writes_are_consistent() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Runs a deterministic mixed SET/DELETE/GET workload against both kvdb and an
+/// in-memory reference map. Periodic flushes, compactions, and reopens exercise
+/// state transitions that a write-only bulk load does not cover.
+#[test]
+#[ignore = "load test; run with --ignored"]
+fn mixed_workload_matches_reference_across_reopens() {
+    let dir = tmp_dir("mixed");
+    let wal = dir.join("kvdb.wal");
+    let mut expected = BTreeMap::new();
+    let mut rng = XorShift64::new(0x4b56_4442_5f4c_4f41);
+
+    const OPERATIONS: usize = 100_000;
+    const KEYSPACE: usize = 10_000;
+    const REOPEN_INTERVAL: usize = 10_000;
+
+    let mut store = Store::open(&wal).unwrap();
+    store.set_memtable_limit(257);
+    store.set_compaction_threshold(5);
+
+    for operation in 0..OPERATIONS {
+        let key_id = rng.next_usize(KEYSPACE);
+        let operation_key = key(key_id);
+        match rng.next_usize(100) {
+            0..=59 => {
+                let value = format!("mixed-value-{operation}-{key_id}").into_bytes();
+                store.set(operation_key.clone(), value.clone()).unwrap();
+                expected.insert(operation_key, value);
+            }
+            60..=84 => {
+                let existed = expected.remove(&operation_key).is_some();
+                assert_eq!(store.delete(&operation_key).unwrap(), existed);
+            }
+            _ => assert_eq!(
+                store.get(&operation_key),
+                expected.get(&operation_key).cloned()
+            ),
+        }
+
+        if (operation + 1) % REOPEN_INTERVAL == 0 {
+            store.flush().unwrap();
+            if (operation / REOPEN_INTERVAL) % 2 == 1 {
+                store.compact().unwrap();
+            }
+            drop(store);
+            store = Store::open(&wal).unwrap();
+            store.set_memtable_limit(257);
+            store.set_compaction_threshold(5);
+
+            for _ in 0..256 {
+                let probe = key(rng.next_usize(KEYSPACE));
+                assert_eq!(store.get(&probe), expected.get(&probe).cloned());
+            }
+        }
+    }
+
+    drop(store);
+    let store = Store::open(&wal).unwrap();
+    assert_eq!(store.len(), expected.len());
+    for i in 0..KEYSPACE {
+        let key = key(i);
+        assert_eq!(store.get(&key), expected.get(&key).cloned(), "key {i}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Builds many versions per key, validates historical reads before GC, then
+/// advances retention and checks that supported history remains exact after a
+/// full compaction and process-style reopen.
+#[test]
+#[ignore = "load test; run with --ignored"]
+fn mvcc_history_and_retention_survive_volume() {
+    let dir = tmp_dir("mvcc");
+    let wal = dir.join("kvdb.wal");
+    let mut histories: Vec<Vec<(u64, Option<Vec<u8>>)>> = vec![Vec::new(); 2_000];
+    let mut rng = XorShift64::new(0x4d56_4343_5f4c_4f41);
+
+    const COMMITS: usize = 30_000;
+    let mut store = Store::open(&wal).unwrap();
+    store.set_memtable_limit(251);
+    store.set_compaction_threshold(4);
+
+    for commit in 0..COMMITS {
+        let key_id = rng.next_usize(histories.len());
+        if rng.next_usize(5) == 0 {
+            store.delete(&key(key_id)).unwrap();
+            histories[key_id].push((store.current_sequence(), None));
+        } else {
+            let value = format!("version-{commit}-{key_id}").into_bytes();
+            store.set(key(key_id), value.clone()).unwrap();
+            histories[key_id].push((store.current_sequence(), Some(value)));
+        }
+    }
+
+    store.flush().unwrap();
+    store.compact().unwrap();
+    for _ in 0..2_000 {
+        let key_id = rng.next_usize(histories.len());
+        let sequence = 1 + rng.next_usize(COMMITS) as u64;
+        assert_eq!(
+            store.get_at(&key(key_id), sequence).unwrap(),
+            value_at(&histories[key_id], sequence)
+        );
+    }
+
+    let history_start = store.current_sequence() - 7_500;
+    store.compact_with_retention(history_start).unwrap();
+    assert_eq!(store.history_start_sequence(), history_start);
+    drop(store);
+
+    let store = Store::open(&wal).unwrap();
+    assert_eq!(store.history_start_sequence(), history_start);
+    assert!(store.snapshot_at(history_start - 1).is_err());
+    for _ in 0..2_000 {
+        let key_id = rng.next_usize(histories.len());
+        let sequence = history_start + rng.next_usize(7_501) as u64;
+        assert_eq!(
+            store.get_at(&key(key_id), sequence).unwrap(),
+            value_at(&histories[key_id], sequence)
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 fn key(i: usize) -> Vec<u8> {
@@ -134,6 +260,31 @@ fn key(i: usize) -> Vec<u8> {
 
 fn value(i: usize) -> Vec<u8> {
     format!("value-number-{i}").into_bytes()
+}
+
+fn value_at(history: &[(u64, Option<Vec<u8>>)], sequence: u64) -> Option<Vec<u8>> {
+    history
+        .iter()
+        .rev()
+        .find(|(version, _)| *version <= sequence)
+        .and_then(|(_, value)| value.clone())
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_usize(&mut self, upper_bound: usize) -> usize {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value as usize % upper_bound
+    }
 }
 
 /// Standard base64 of `user:pass` for the Basic auth header.

@@ -4,6 +4,14 @@ on:
   push:
     branches: [ master ]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +21,7 @@ jobs:
   ci:
     name: fmt / clippy / build / test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -28,34 +37,109 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets --locked
 
       - name: Build
-        run: cargo build --release --all-targets
+        run: cargo build --release --all-targets --locked
 
       - name: Test
-        run: cargo test --all
+        run: cargo test --all --locked
 
-      # Informational only: throughput numbers are surfaced in the run's job
-      # summary, not gated. Absolute values are noisy on shared runners — the
-      # #[ignore]d perf tests still fail the step if they panic (a correctness
-      # check), but the timings are for eyeballing, not pass/fail.
-      - name: Performance (informational)
+  load:
+    name: release load tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run load tests sequentially
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test load -- \
+            --ignored --nocapture --test-threads=1 2>&1 \
+            | tee "$RUNNER_TEMP/load-tests.txt"
+
+      - name: Add load result to summary
+        if: always()
+        run: |
+          {
+            echo '### Release load tests'
+            echo ''
+            echo '```text'
+            grep -E 'running [0-9]+ tests|test result:' "$RUNNER_TEMP/load-tests.txt" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload load test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-log
+          path: ${{ runner.temp }}/load-tests.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  performance:
+    name: performance (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      # There are deliberately no timing thresholds: shared-runner performance
+      # is noisy. Panics and correctness failures still fail this job.
+      - name: Run performance suite sequentially
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test perf -- \
+            --ignored --nocapture --test-threads=1 2>&1 \
+            | tee "$RUNNER_TEMP/performance.txt"
+
+      - name: Add metrics to summary
+        if: always()
         run: |
           {
             echo '### Performance (informational)'
             echo ''
-            echo '_Micro-benchmarks on a shared CI runner — absolute numbers are noisy; use for rough trends only._'
+            echo '_Shared-runner results are noisy and do not gate on timing._'
             echo ''
+            echo '```text'
+            grep -E 'ops/sec|DURATION|^STORAGE|test result:' \
+              "$RUNNER_TEMP/performance.txt" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          cargo test --release --test perf -- --ignored --nocapture 2>&1 \
-            | grep 'ops/sec' | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload performance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-log
+          path: ${{ runner.temp }}/performance.txt
+          if-no-files-found: ignore
+          retention-days: 14
 
   docker:
     name: docker build + smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
