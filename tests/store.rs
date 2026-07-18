@@ -420,6 +420,57 @@ fn compaction_of_only_tombstones_publishes_an_empty_manifest() {
 }
 
 #[test]
+fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
+    let dir = tmp_dir("compact-auto");
+    let wal = dir.join("kvdb.wal");
+
+    let mut s = Store::open(&wal).unwrap();
+    s.set_memtable_limit(1);
+    s.set_compaction_threshold(3);
+
+    s.set(b"a".to_vec(), b"one".to_vec()).unwrap();
+    s.set(b"b".to_vec(), b"two".to_vec()).unwrap();
+    assert_eq!(s.sstable_count(), 2);
+    s.set(b"c".to_vec(), b"three".to_vec()).unwrap();
+    assert_eq!(s.sstable_count(), 1, "third table triggers compaction");
+
+    assert!(s.delete(b"a").unwrap());
+    assert_eq!(s.sstable_count(), 2);
+    s.set(b"d".to_vec(), b"four".to_vec()).unwrap();
+    assert_eq!(s.sstable_count(), 1, "threshold triggers again");
+    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"b"), Some(b"two".to_vec()));
+    assert_eq!(s.get(b"c"), Some(b"three".to_vec()));
+    assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
+    drop(s);
+
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(s.sstable_count(), 1);
+    assert_eq!(s.current_sequence(), 5);
+    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn automatic_compaction_can_be_disabled() {
+    let dir = tmp_dir("compact-disabled");
+    let wal = dir.join("kvdb.wal");
+
+    let mut s = Store::open(&wal).unwrap();
+    s.set_memtable_limit(1);
+    s.set_compaction_threshold(0);
+    for i in 0..10 {
+        s.set(format!("key-{i}").into_bytes(), b"value".to_vec())
+            .unwrap();
+    }
+    assert_eq!(s.sstable_count(), 10);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn atomic_batch_applies_in_order_with_one_sequence_number() {
     let path = tmp_path("batch");
     let mut s = Store::open(&path).unwrap();

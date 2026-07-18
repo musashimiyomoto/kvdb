@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::sstable::{SsTable, Value};
+use crate::sstable::{SsTable, Value, VersionedValue};
 use crate::{log_debug, log_info, log_warn};
 
 /// WAL operation codes.
@@ -29,6 +29,7 @@ const OP_BATCH: u8 = 3;
 
 /// Default memtable size (live + tombstone entries) that triggers a flush.
 const DEFAULT_MEMTABLE_LIMIT: usize = 1024;
+const DEFAULT_COMPACTION_THRESHOLD: usize = 8;
 
 const TARGET: &str = "kvdb::store";
 
@@ -198,7 +199,7 @@ impl WriteBatch {
 /// A single-node, crash-safe key-value store: WAL + memtable + SSTables.
 pub struct Store {
     /// Sorted in-memory view of the most recent mutations (since the last flush).
-    memtable: BTreeMap<Vec<u8>, Value>,
+    memtable: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     /// Buffered append-only handle to the WAL file.
     wal: BufWriter<File>,
     /// Path of the WAL; also the anchor for SSTable / manifest paths.
@@ -215,6 +216,8 @@ pub struct Store {
     key_sequences: BTreeMap<Vec<u8>, u64>,
     /// Flush the memtable once it reaches this many entries.
     memtable_limit: usize,
+    /// Compact after reaching this many SSTables; `None` disables automation.
+    compaction_threshold: Option<usize>,
 }
 
 impl Store {
@@ -262,6 +265,7 @@ impl Store {
             durable_sequence: manifest.sequence,
             key_sequences: BTreeMap::new(),
             memtable_limit: memtable_limit_from_env(),
+            compaction_threshold: compaction_threshold_from_env(),
         })
     }
 
@@ -270,7 +274,10 @@ impl Store {
     /// A truncated trailing record (e.g. from a crash mid-write) is treated as
     /// "not committed" and silently dropped, rather than failing recovery. A
     /// DELETE replays as a tombstone so it still shadows any older SSTable value.
-    fn replay(path: &Path, durable_sequence: u64) -> io::Result<(BTreeMap<Vec<u8>, Value>, u64)> {
+    fn replay(
+        path: &Path,
+        durable_sequence: u64,
+    ) -> io::Result<(BTreeMap<Vec<u8>, Vec<VersionedValue>>, u64)> {
         let mut map = BTreeMap::new();
         let mut sequence = durable_sequence;
 
@@ -305,7 +312,12 @@ impl Store {
 
     /// Returns the value for `key`, if present and not deleted.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self.lookup(key) {
+        self.get_at(key, u64::MAX)
+    }
+
+    /// Returns the value visible at `sequence`, if it existed and was live.
+    pub fn get_at(&self, key: &[u8], sequence: u64) -> Option<Vec<u8>> {
+        match self.lookup_at(key, sequence) {
             Some(Value::Set(v)) => Some(v),
             _ => None, // tombstone or genuinely absent
         }
@@ -314,7 +326,11 @@ impl Store {
     /// Resolves a key across every level, newest to oldest, returning the first
     /// record found (which may be a tombstone). `None` means no level knows it.
     fn lookup(&self, key: &[u8]) -> Option<Value> {
-        match self.lookup_result(key) {
+        self.lookup_at(key, u64::MAX)
+    }
+
+    fn lookup_at(&self, key: &[u8], sequence: u64) -> Option<Value> {
+        match self.lookup_at_result(key, sequence) {
             Ok(value) => value,
             Err(e) => {
                 log_warn!(TARGET, "sstable read failed for a key: {e}");
@@ -324,13 +340,22 @@ impl Store {
     }
 
     fn lookup_result(&self, key: &[u8]) -> io::Result<Option<Value>> {
+        self.lookup_at_result(key, u64::MAX)
+    }
+
+    fn lookup_at_result(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
         // Memtable is newest.
-        if let Some(v) = self.memtable.get(key) {
-            return Ok(Some(v.clone()));
+        if let Some(versions) = self.memtable.get(key)
+            && let Some(version) = versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= sequence)
+        {
+            return Ok(Some(version.value.clone()));
         }
         // Then SSTables, newest (last pushed) first.
         for sst in self.sstables.iter().rev() {
-            match sst.get(key) {
+            match sst.get_at(key, sequence) {
                 Ok(Some(v)) => return Ok(Some(v)),
                 Ok(None) => continue,
                 Err(e) => return Err(e),
@@ -345,7 +370,7 @@ impl Store {
         write_set(&mut self.wal, sequence, &key, &value)?;
         self.wal.flush()?;
         self.key_sequences.insert(key.clone(), sequence);
-        self.memtable.insert(key, Value::Set(value));
+        insert_version(&mut self.memtable, key, sequence, Value::Set(value));
         self.sequence = sequence;
         self.maybe_flush()
     }
@@ -362,7 +387,7 @@ impl Store {
         self.wal.flush()?;
         let key = key.to_vec();
         self.key_sequences.insert(key.clone(), sequence);
-        self.memtable.insert(key, Value::Tombstone);
+        insert_version(&mut self.memtable, key, sequence, Value::Tombstone);
         self.sequence = sequence;
         self.maybe_flush()?;
         Ok(existed)
@@ -382,7 +407,7 @@ impl Store {
         for operation in batch.operations {
             self.key_sequences
                 .insert(operation.key().to_vec(), sequence);
-            apply_operation(&mut self.memtable, operation);
+            apply_operation(&mut self.memtable, sequence, operation);
         }
         self.sequence = sequence;
         self.maybe_flush()?;
@@ -423,7 +448,9 @@ impl Store {
         // 1. Write the sorted memtable to a fresh SSTable, durably.
         SsTable::write(
             &sst_path,
-            self.memtable.iter().map(|(k, v)| (k.as_slice(), v)),
+            self.memtable
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
         )?;
 
         // 2. Publish it by appending to the manifest (temp + fsync + rename).
@@ -447,6 +474,16 @@ impl Store {
             name,
             self.sstables.len()
         );
+        self.maybe_compact()
+    }
+
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        if self
+            .compaction_threshold
+            .is_some_and(|threshold| self.sstables.len() >= threshold)
+        {
+            self.compact()?;
+        }
         Ok(())
     }
 
@@ -476,7 +513,9 @@ impl Store {
             let path = dir.join(&name);
             SsTable::write(
                 &path,
-                merged.iter().map(|(key, value)| (key.as_slice(), value)),
+                merged
+                    .iter()
+                    .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
             )?;
             let table = SsTable::open(&path)?;
             Some((name, table))
@@ -572,6 +611,15 @@ impl Store {
         }
     }
 
+    /// Overrides the automatic compaction threshold. Values greater than zero
+    /// are clamped to at least 2 SSTables; zero disables automatic compaction.
+    pub fn set_compaction_threshold(&mut self, threshold: usize) {
+        self.compaction_threshold = match threshold {
+            0 => None,
+            value => Some(value.max(2)),
+        };
+    }
+
     /// Number of SSTables currently live (flushed and recorded in the manifest).
     pub fn sstable_count(&self) -> usize {
         self.sstables.len()
@@ -656,8 +704,10 @@ impl Store {
 /// K-way merge sorted SSTables, oldest to newest. When more than one source
 /// has the same key, the last source wins; tombstones are omitted because a
 /// full compaction leaves no older level for them to shadow.
-fn merge_sstables(sstables: &[SsTable]) -> io::Result<Vec<(Vec<u8>, Value)>> {
-    let sources: Vec<Vec<(Vec<u8>, Value)>> = sstables
+fn merge_sstables(
+    sstables: &[SsTable],
+) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
+    let sources: Vec<Vec<(Vec<u8>, Vec<VersionedValue>)>> = sstables
         .iter()
         .map(SsTable::entries)
         .collect::<io::Result<_>>()?;
@@ -673,21 +723,27 @@ fn merge_sstables(sstables: &[SsTable]) -> io::Result<Vec<(Vec<u8>, Value)>> {
         .min_by(|(_, left), (_, right)| left.cmp(right))
     {
         let key = key.clone();
-        let mut newest = None;
+        let mut versions = BTreeMap::new();
 
         for (source, entries) in sources.iter().enumerate() {
             if entries
                 .get(positions[source])
                 .is_some_and(|(candidate, _)| candidate == &key)
             {
-                newest = Some(entries[positions[source]].1.clone());
+                for version in &entries[positions[source]].1 {
+                    versions.insert(version.sequence, version.value.clone());
+                }
                 positions[source] += 1;
             }
         }
 
-        if let Some(Value::Set(value)) = newest {
-            merged.push((key, Value::Set(value)));
-        }
+        merged.push((
+            key,
+            versions
+                .into_iter()
+                .map(|(sequence, value)| VersionedValue { sequence, value })
+                .collect(),
+        ));
     }
 
     Ok(merged)
@@ -831,32 +887,59 @@ impl Record {
         }
     }
 
-    fn apply_to(self, map: &mut BTreeMap<Vec<u8>, Value>) {
+    fn apply_to(self, map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>) {
         match self {
-            Record::Set { key, value, .. } => {
-                map.insert(key, Value::Set(value));
+            Record::Set {
+                sequence,
+                key,
+                value,
+            } => {
+                insert_version(map, key, sequence, Value::Set(value));
             }
-            Record::Delete { key, .. } => {
-                map.insert(key, Value::Tombstone);
+            Record::Delete { sequence, key } => {
+                insert_version(map, key, sequence, Value::Tombstone);
             }
-            Record::Batch { operations, .. } => {
+            Record::Batch {
+                sequence,
+                operations,
+            } => {
                 for operation in operations {
-                    apply_operation(map, operation);
+                    apply_operation(map, sequence, operation);
                 }
             }
         }
     }
 }
 
-fn apply_operation(map: &mut BTreeMap<Vec<u8>, Value>, operation: BatchOperation) {
+fn apply_operation(
+    map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    sequence: u64,
+    operation: BatchOperation,
+) {
     match operation {
         BatchOperation::Set { key, value } => {
-            map.insert(key, Value::Set(value));
+            insert_version(map, key, sequence, Value::Set(value));
         }
         BatchOperation::Delete { key } => {
-            map.insert(key, Value::Tombstone);
+            insert_version(map, key, sequence, Value::Tombstone);
         }
     }
+}
+
+fn insert_version(
+    map: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    key: Vec<u8>,
+    sequence: u64,
+    value: Value,
+) {
+    let versions = map.entry(key).or_default();
+    if let Some(last) = versions.last_mut()
+        && last.sequence == sequence
+    {
+        last.value = value;
+        return;
+    }
+    versions.push(VersionedValue { sequence, value });
 }
 
 /// Encodes a SET record: `[OP_SET][sequence][key_len][key][val_len][value]`.
@@ -1018,4 +1101,17 @@ fn memtable_limit_from_env() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MEMTABLE_LIMIT)
+}
+
+/// Reads `KVDB_COMPACTION_THRESHOLD`. Zero disables automatic compaction;
+/// positive values are clamped to at least two SSTables.
+fn compaction_threshold_from_env() -> Option<usize> {
+    match std::env::var("KVDB_COMPACTION_THRESHOLD") {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(0) => None,
+            Ok(value) => Some(value.max(2)),
+            Err(_) => Some(DEFAULT_COMPACTION_THRESHOLD),
+        },
+        Err(_) => Some(DEFAULT_COMPACTION_THRESHOLD),
+    }
 }

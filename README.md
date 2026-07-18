@@ -96,9 +96,11 @@ stores records in 64-entry blocks with a persisted
 **sparse index** (one first-key + byte range per block) and a **Bloom filter**.
 Opening a table does not load every key into memory; a Bloom negative skips the
 file entirely, while a possible hit binary-searches the index and scans one
-block. Calling `Store::compact()` fully merges the live SSTables, retains only
-the newest value for each key, drops tombstones, and atomically replaces the
-manifest.
+block. Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the
+Store automatically performs a full compaction: it retains only the newest
+value for each key, drops tombstones, and atomically replaces the manifest.
+Setting the threshold to `0` disables automation; `Store::compact()` remains
+available for an explicit run.
 
 ### Atomic batches
 
@@ -198,6 +200,7 @@ runs as a non-root user.
   one first-key + byte range per block stays resident in memory)
 - [x] **compaction** — full k-way merge of SSTables; drop shadowed entries and
   tombstones, then atomically publish the replacement manifest
+- [x] automatic compaction trigger by SSTable count (default `8`, configurable)
 - [x] **bloom filters** persisted with each new SSTable to skip files that
   definitely cannot contain a key (false positives still use the normal lookup)
 - [x] durable **sequence numbers** + atomic WAL **write batches**

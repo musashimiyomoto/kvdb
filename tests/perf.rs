@@ -121,6 +121,7 @@ fn perf_get_miss() {
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
     s.set_memtable_limit(10_000); // several SSTables to scan through on a miss
+    s.set_compaction_threshold(0); // retain all levels for the worst-case miss
 
     const N: usize = 100_000;
     for i in 0..N {

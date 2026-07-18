@@ -43,6 +43,7 @@ fn bulk_insert_survives_many_flushes_and_reopen() {
     {
         let mut s = Store::open(&wal).unwrap();
         s.set_memtable_limit(1_000); // ~100 flushes
+        s.set_compaction_threshold(0); // this test intentionally keeps every table
         for i in 0..N {
             s.set(key(i), value(i)).unwrap();
         }

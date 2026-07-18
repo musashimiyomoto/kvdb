@@ -18,11 +18,12 @@
 //!   [index_offset:u64 BE]["KVDBEND1"]
 //! ```
 //!
-//! Each record is encoded as:
+//! Each record is encoded as one key plus its versions in ascending sequence:
 //!
 //! ```text
-//!   [flag:u8][key_len:u32 BE][key]            (flag = 1: Tombstone)
-//!   [flag:u8][key_len:u32 BE][key][val_len:u32 BE][value]   (flag = 0: Set)
+//!   [key_len:u32 BE][key][version_count:u32 BE]
+//!     repeated: [sequence:u64 BE][flag:u8][value_len:u32 BE][value] (Set)
+//!     or:       [sequence:u64 BE][flag:u8]                       (Tombstone)
 //! ```
 //!
 //! A lookup first uses the Bloom filter to reject keys that cannot be present,
@@ -61,15 +62,11 @@ pub enum Value {
     Tombstone,
 }
 
-impl Value {
-    /// The number of bytes this record occupies on disk, including its header.
-    fn encoded_len(&self, key: &[u8]) -> u64 {
-        let head = 1 + 4 + key.len() as u64;
-        match self {
-            Value::Set(v) => head + 4 + v.len() as u64,
-            Value::Tombstone => head,
-        }
-    }
+/// One durable version of a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionedValue {
+    pub sequence: u64,
+    pub value: Value,
 }
 
 #[derive(Debug)]
@@ -137,7 +134,7 @@ impl SsTable {
     /// renamed into place, so a crash never leaves a half-written `path`.
     pub fn write<'a, I>(path: &Path, entries: I) -> io::Result<()>
     where
-        I: IntoIterator<Item = (&'a [u8], &'a Value)>,
+        I: IntoIterator<Item = (&'a [u8], &'a [VersionedValue])>,
     {
         let tmp = tmp_path(path);
         let file = File::create(&tmp)?;
@@ -150,7 +147,7 @@ impl SsTable {
         let mut offset = FILE_MAGIC.len() as u64;
         let mut record_count = 0usize;
 
-        for (key, value) in entries {
+        for (key, versions) in entries {
             if previous_key
                 .as_deref()
                 .is_some_and(|previous| previous >= key)
@@ -171,9 +168,9 @@ impl SsTable {
                 });
             }
 
-            write_record(&mut w, key, value)?;
+            write_record(&mut w, key, versions)?;
             offset = offset
-                .checked_add(value.encoded_len(key))
+                .checked_add(encoded_record_len(key, versions)?)
                 .ok_or_else(|| invalid_input("SSTable is too large"))?;
             blocks.last_mut().expect("a block was just created").records += 1;
             record_count += 1;
@@ -220,6 +217,11 @@ impl SsTable {
     /// Looks up `key`. Returns a live value, a tombstone, or no record. At most
     /// one data block is read after binary-searching the sparse index.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
+        self.get_at(key, u64::MAX)
+    }
+
+    /// Looks up the newest version whose sequence is at most `sequence`.
+    pub fn get_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
         if !self.bloom.may_contain(key) {
             return Ok(None);
         }
@@ -238,12 +240,18 @@ impl SsTable {
         let mut previous_key: Option<Vec<u8>> = None;
         let mut records_read = 0usize;
 
-        while let Some((record_key, value)) = read_record(&mut reader)? {
+        while let Some((record_key, versions)) = read_record(&mut reader)? {
             validate_block_record(block, &record_key, previous_key.as_deref(), records_read)?;
             records_read += 1;
             match record_key.as_slice().cmp(key) {
                 Ordering::Less => previous_key = Some(record_key),
-                Ordering::Equal => return Ok(Some(value)),
+                Ordering::Equal => {
+                    return Ok(versions
+                        .iter()
+                        .rev()
+                        .find(|version| version.sequence <= sequence)
+                        .map(|version| version.value.clone()));
+                }
                 Ordering::Greater => return Ok(None),
             }
         }
@@ -258,7 +266,7 @@ impl SsTable {
     /// Reads every record in ascending key order. This is intentionally a disk
     /// scan: callers that need the full table must not force a dense resident
     /// index.
-    pub fn entries(&self) -> io::Result<Vec<(Vec<u8>, Value)>> {
+    pub fn entries(&self) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
         let mut entries = Vec::with_capacity(self.len);
         if self.blocks.is_empty() {
             return Ok(entries);
@@ -271,7 +279,7 @@ impl SsTable {
             let mut reader = BufReader::new((&mut file).take(block.end - block.start));
             let mut previous_key: Option<Vec<u8>> = None;
             let mut records_read = 0usize;
-            while let Some((key, value)) = read_record(&mut reader)? {
+            while let Some((key, versions)) = read_record(&mut reader)? {
                 validate_block_record(block, &key, previous_key.as_deref(), records_read)?;
                 if previous_table_key
                     .as_deref()
@@ -281,7 +289,7 @@ impl SsTable {
                 }
                 previous_key = Some(key.clone());
                 previous_table_key = Some(key.clone());
-                entries.push((key, value));
+                entries.push((key, versions));
                 records_read += 1;
             }
             if records_read != block.records {
@@ -475,20 +483,42 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Encodes one record (see the module-level format docs).
-fn write_record<W: Write>(w: &mut W, key: &[u8], value: &Value) -> io::Result<()> {
-    match value {
-        Value::Set(v) => {
-            w.write_all(&[FLAG_SET])?;
-            write_chunk(w, key)?;
-            write_chunk(w, v)?;
-        }
-        Value::Tombstone => {
-            w.write_all(&[FLAG_TOMBSTONE])?;
-            write_chunk(w, key)?;
+/// Encodes one key and all of its versions (see the module-level format docs).
+fn write_record<W: Write>(w: &mut W, key: &[u8], versions: &[VersionedValue]) -> io::Result<()> {
+    validate_versions(versions, io::ErrorKind::InvalidInput)?;
+    write_chunk(w, key)?;
+    let count = u32::try_from(versions.len())
+        .map_err(|_| invalid_input("SSTable key has too many versions"))?;
+    w.write_all(&count.to_be_bytes())?;
+    for version in versions {
+        w.write_all(&version.sequence.to_be_bytes())?;
+        match &version.value {
+            Value::Set(value) => {
+                w.write_all(&[FLAG_SET])?;
+                write_chunk(w, value)?;
+            }
+            Value::Tombstone => w.write_all(&[FLAG_TOMBSTONE])?,
         }
     }
     Ok(())
+}
+
+fn encoded_record_len(key: &[u8], versions: &[VersionedValue]) -> io::Result<u64> {
+    validate_versions(versions, io::ErrorKind::InvalidInput)?;
+    let mut len = 4u64
+        .checked_add(key.len() as u64)
+        .and_then(|len| len.checked_add(4))
+        .ok_or_else(|| invalid_input("SSTable record is too large"))?;
+    for version in versions {
+        let version_len = match &version.value {
+            Value::Set(value) => 8 + 1 + 4 + value.len() as u64,
+            Value::Tombstone => 8 + 1,
+        };
+        len = len
+            .checked_add(version_len)
+            .ok_or_else(|| invalid_input("SSTable record is too large"))?;
+    }
+    Ok(len)
 }
 
 fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
@@ -498,28 +528,54 @@ fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Reads one record. A torn record is corruption because SSTables are atomic.
-fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(Vec<u8>, Value)>> {
-    let mut flag = [0u8; 1];
-    match r.read_exact(&mut flag) {
+fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(Vec<u8>, Vec<VersionedValue>)>> {
+    let mut key_len = [0u8; 4];
+    match r.read_exact(&mut key_len[..1]) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
+    r.read_exact(&mut key_len[1..])?;
+    let mut key = vec![0u8; u32::from_be_bytes(key_len) as usize];
+    r.read_exact(&mut key)?;
 
-    match flag[0] {
-        FLAG_SET => {
-            let key = read_chunk(r)?;
-            let value = read_chunk(r)?;
-            Ok(Some((key, Value::Set(value))))
-        }
-        FLAG_TOMBSTONE => {
-            let key = read_chunk(r)?;
-            Ok(Some((key, Value::Tombstone)))
-        }
-        other => Err(invalid_data(format!(
-            "unknown SSTable record flag: {other}"
-        ))),
+    let count = read_u32(r)? as usize;
+    if count == 0 {
+        return Err(invalid_data("SSTable key has no versions"));
     }
+    let mut versions = Vec::new();
+    for _ in 0..count {
+        let sequence = read_u64(r)?;
+        let value = match read_u8(r)? {
+            FLAG_SET => Value::Set(read_chunk(r)?),
+            FLAG_TOMBSTONE => Value::Tombstone,
+            other => {
+                return Err(invalid_data(format!(
+                    "unknown SSTable version flag: {other}"
+                )));
+            }
+        };
+        versions.push(VersionedValue { sequence, value });
+    }
+    validate_versions(&versions, io::ErrorKind::InvalidData)?;
+    Ok(Some((key, versions)))
+}
+
+fn validate_versions(versions: &[VersionedValue], kind: io::ErrorKind) -> io::Result<()> {
+    if versions.is_empty() {
+        return Err(io::Error::new(kind, "SSTable key has no versions"));
+    }
+    let mut previous = 0;
+    for version in versions {
+        if version.sequence == 0 || version.sequence <= previous {
+            return Err(io::Error::new(
+                kind,
+                "SSTable versions are not strictly increasing",
+            ));
+        }
+        previous = version.sequence;
+    }
+    Ok(())
 }
 
 fn read_index_key<R: Read>(r: &mut std::io::Take<R>) -> io::Result<Vec<u8>> {
