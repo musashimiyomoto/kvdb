@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use kvdb::store::{Store, WriteBatch};
+use kvdb::store::{Store, TransactionError, WriteBatch};
 
 /// Returns a fresh, unique temp WAL path and removes any leftover from a
 /// previous run with the same tag.
@@ -569,6 +569,112 @@ fn snapshot_remains_stable_after_writes_flush_and_compaction() {
     assert_eq!(current.get(b"added"), Some(b"later".as_slice()));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimistic_transaction_reads_its_writes_and_commits_atomically() {
+    let path = tmp_path("transaction");
+    let mut s = Store::open(&path).unwrap();
+    s.set(b"balance".to_vec(), b"100".to_vec()).unwrap();
+
+    let mut transaction = s.begin_transaction().unwrap();
+    assert_eq!(transaction.base_sequence(), 1);
+    assert_eq!(transaction.get(b"balance"), Some(b"100".as_slice()));
+    transaction
+        .set(b"balance".to_vec(), b"90".to_vec())
+        .set(b"audit".to_vec(), b"withdraw 10".to_vec())
+        .delete(b"temporary".to_vec());
+    assert_eq!(transaction.get(b"balance"), Some(b"90".as_slice()));
+    assert_eq!(transaction.get(b"audit"), Some(b"withdraw 10".as_slice()));
+    assert_eq!(transaction.get(b"temporary"), None);
+
+    // Uncommitted writes are private to the transaction.
+    assert_eq!(s.get(b"balance"), Some(b"100".to_vec()));
+    assert_eq!(s.get(b"audit"), None);
+
+    assert_eq!(s.commit_transaction(transaction).unwrap(), 2);
+    assert_eq!(s.get(b"balance"), Some(b"90".to_vec()));
+    assert_eq!(s.get(b"audit"), Some(b"withdraw 10".to_vec()));
+    drop(s);
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.get(b"balance"), Some(b"90".to_vec()));
+    assert_eq!(s.get(b"audit"), Some(b"withdraw 10".to_vec()));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn optimistic_transaction_conflict_has_no_partial_writes() {
+    let path = tmp_path("transaction-conflict");
+    let mut s = Store::open(&path).unwrap();
+    s.set(b"key".to_vec(), b"snapshot".to_vec()).unwrap();
+
+    let mut transaction = s.begin_transaction().unwrap();
+    transaction
+        .set(b"key".to_vec(), b"transaction".to_vec())
+        .set(b"only-in-transaction".to_vec(), b"hidden".to_vec());
+
+    s.set(b"key".to_vec(), b"concurrent".to_vec()).unwrap();
+    assert_eq!(transaction.get(b"key"), Some(b"transaction".as_slice()));
+
+    let error = s.commit_transaction(transaction).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::Conflict {
+            expected: 1,
+            actual: 2,
+            ..
+        }
+    ));
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.get(b"key"), Some(b"concurrent".to_vec()));
+    assert_eq!(s.get(b"only-in-transaction"), None);
+
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.current_sequence(), 2);
+    assert_eq!(s.get(b"key"), Some(b"concurrent".to_vec()));
+    assert_eq!(s.get(b"only-in-transaction"), None);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn independent_transactions_can_both_commit() {
+    let path = tmp_path("transaction-independent");
+    let mut s = Store::open(&path).unwrap();
+    let mut left = s.begin_transaction().unwrap();
+    let mut right = s.begin_transaction().unwrap();
+    left.set(b"left".to_vec(), b"one".to_vec());
+    right.set(b"right".to_vec(), b"two".to_vec());
+
+    assert_eq!(s.commit_transaction(left).unwrap(), 1);
+    assert_eq!(s.commit_transaction(right).unwrap(), 2);
+    assert_eq!(s.get(b"left"), Some(b"one".to_vec()));
+    assert_eq!(s.get(b"right"), Some(b"two".to_vec()));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn transaction_read_conflict_detects_a_key_added_after_snapshot() {
+    let path = tmp_path("transaction-read-conflict");
+    let mut s = Store::open(&path).unwrap();
+    let mut transaction = s.begin_transaction().unwrap();
+    assert_eq!(transaction.get(b"missing"), None);
+    transaction.set(b"derived".to_vec(), b"value".to_vec());
+
+    s.set(b"missing".to_vec(), b"now-present".to_vec()).unwrap();
+    let error = s.commit_transaction(transaction).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::Conflict { key, .. } if key == b"missing"
+    ));
+    assert_eq!(s.get(b"derived"), None);
+
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

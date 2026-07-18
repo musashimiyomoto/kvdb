@@ -125,6 +125,13 @@ do not affect it. This first snapshot implementation deliberately copies the
 logical state, so creating one costs O(keys + values) memory; it does not yet
 retain multiple versions inside SSTables.
 
+`Store::begin_transaction()` builds on that snapshot with a private write
+overlay. Reads see the transaction's own SET/DELETE operations first. Commit is
+optimistic: `commit_transaction()` writes the overlay as one atomic batch only
+if none of the transaction's read or written keys changed after its snapshot.
+Independent transactions touching different keys can both commit; dropping a
+transaction aborts it without WAL I/O.
+
 ### Talk to it with curl
 
 ```sh
@@ -195,4 +202,6 @@ runs as a non-root user.
   definitely cannot contain a key (false positives still use the normal lookup)
 - [x] durable **sequence numbers** + atomic WAL **write batches**
 - [x] immutable read-only **snapshots** at a fixed sequence (copy-on-snapshot)
-- [ ] write transactions / full MVCC with per-key versions
+- [x] optimistic **write transactions** with read-your-writes, atomic commit, and
+  key-level read/write conflict detection
+- [ ] full MVCC with per-key versions and key-level conflict detection

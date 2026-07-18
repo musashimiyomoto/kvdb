@@ -14,7 +14,7 @@
 //! Read precedence, newest to oldest: **memtable → SSTables (newest first)**.
 //! The first record found wins, and a tombstone found first means "not present".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,14 @@ const TARGET: &str = "kvdb::store";
 pub enum BatchOperation {
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
+}
+
+impl BatchOperation {
+    fn key(&self) -> &[u8] {
+        match self {
+            BatchOperation::Set { key, .. } | BatchOperation::Delete { key } => key,
+        }
+    }
 }
 
 /// A group of mutations committed as one WAL record and one sequence number.
@@ -73,6 +81,93 @@ impl Snapshot {
     /// Commit sequence captured by this snapshot.
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+}
+
+/// An optimistic transaction backed by an immutable snapshot and a write
+/// overlay. Dropping it aborts without touching the WAL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transaction {
+    base_sequence: u64,
+    snapshot: Snapshot,
+    batch: WriteBatch,
+    overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    read_set: BTreeSet<Vec<u8>>,
+}
+
+impl Transaction {
+    /// Reads from the transaction's own writes first, then its fixed snapshot.
+    pub fn get(&mut self, key: &[u8]) -> Option<&[u8]> {
+        self.read_set.insert(key.to_vec());
+        match self.overlay.get(key) {
+            Some(Some(value)) => Some(value),
+            Some(None) => None,
+            None => self.snapshot.get(key),
+        }
+    }
+
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> &mut Self {
+        self.overlay.insert(key.clone(), Some(value.clone()));
+        self.batch.set(key, value);
+        self
+    }
+
+    pub fn delete(&mut self, key: Vec<u8>) -> &mut Self {
+        self.overlay.insert(key.clone(), None);
+        self.batch.delete(key);
+        self
+    }
+
+    pub fn base_sequence(&self) -> u64 {
+        self.base_sequence
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+}
+
+/// Failure to commit an optimistic [`Transaction`].
+#[derive(Debug)]
+pub enum TransactionError {
+    /// Another commit changed the Store after this transaction's snapshot.
+    Conflict {
+        key: Vec<u8>,
+        expected: u64,
+        actual: u64,
+    },
+    /// The atomic WAL batch could not be committed.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for TransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionError::Conflict {
+                key,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "transaction conflict for key {key:?}: expected at most sequence {expected}, actual {actual}"
+            ),
+            TransactionError::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TransactionError::Conflict { .. } => None,
+            TransactionError::Io(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for TransactionError {
+    fn from(error: io::Error) -> Self {
+        TransactionError::Io(error)
     }
 }
 
@@ -116,6 +211,8 @@ pub struct Store {
     sequence: u64,
     /// Latest sequence already represented by the manifest's SSTables.
     durable_sequence: u64,
+    /// Last commit sequence for keys changed since this Store was opened.
+    key_sequences: BTreeMap<Vec<u8>, u64>,
     /// Flush the memtable once it reaches this many entries.
     memtable_limit: usize,
 }
@@ -163,6 +260,7 @@ impl Store {
             next_seq,
             sequence,
             durable_sequence: manifest.sequence,
+            key_sequences: BTreeMap::new(),
             memtable_limit: memtable_limit_from_env(),
         })
     }
@@ -246,6 +344,7 @@ impl Store {
         let sequence = self.next_sequence()?;
         write_set(&mut self.wal, sequence, &key, &value)?;
         self.wal.flush()?;
+        self.key_sequences.insert(key.clone(), sequence);
         self.memtable.insert(key, Value::Set(value));
         self.sequence = sequence;
         self.maybe_flush()
@@ -261,7 +360,9 @@ impl Store {
         let sequence = self.next_sequence()?;
         write_delete(&mut self.wal, sequence, key)?;
         self.wal.flush()?;
-        self.memtable.insert(key.to_vec(), Value::Tombstone);
+        let key = key.to_vec();
+        self.key_sequences.insert(key.clone(), sequence);
+        self.memtable.insert(key, Value::Tombstone);
         self.sequence = sequence;
         self.maybe_flush()?;
         Ok(existed)
@@ -279,6 +380,8 @@ impl Store {
         write_batch(&mut self.wal, sequence, &batch.operations)?;
         self.wal.flush()?;
         for operation in batch.operations {
+            self.key_sequences
+                .insert(operation.key().to_vec(), sequence);
             apply_operation(&mut self.memtable, operation);
         }
         self.sequence = sequence;
@@ -498,6 +601,45 @@ impl Store {
             sequence: self.sequence,
             values,
         })
+    }
+
+    /// Starts an optimistic transaction over a fixed read-only snapshot.
+    pub fn begin_transaction(&self) -> io::Result<Transaction> {
+        let snapshot = self.snapshot()?;
+        Ok(Transaction {
+            base_sequence: snapshot.sequence(),
+            snapshot,
+            batch: WriteBatch::new(),
+            overlay: BTreeMap::new(),
+            read_set: BTreeSet::new(),
+        })
+    }
+
+    /// Commits a transaction if no mutation has advanced the Store since its
+    /// snapshot. All writes are persisted atomically through one [`WriteBatch`].
+    pub fn commit_transaction(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<u64, TransactionError> {
+        let Transaction {
+            base_sequence,
+            batch,
+            overlay,
+            mut read_set,
+            ..
+        } = transaction;
+        read_set.extend(overlay.into_keys());
+        for key in read_set {
+            let actual = self.key_sequences.get(&key).copied().unwrap_or(0);
+            if actual > base_sequence {
+                return Err(TransactionError::Conflict {
+                    key,
+                    expected: base_sequence,
+                    actual,
+                });
+            }
+        }
+        Ok(self.write_batch(batch)?)
     }
 
     /// Path to the backing WAL file.
