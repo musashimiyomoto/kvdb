@@ -274,30 +274,15 @@ Credentials are passed at run time and are never baked into the image. The WAL
 lives on the `/data` volume, so data survives container restarts. The server
 runs as a non-root user.
 
-## Roadmap (LSM tree)
+## Roadmap
 
-- [x] memtable + WAL + recovery
-- [x] HTTP/REST API with Basic auth
-- [x] logging to console **and** file (no external crates)
-- [x] represent deletes as **tombstones** in the memtable — a delete must leave a
-  trace so it can shadow an older on-disk value instead of resurrecting it
-- [x] flush the memtable into an immutable sorted **SSTable** once it crosses a
-  threshold; seal (truncate) the WAL and record the file in a **manifest**
-- [x] read path: memtable → newest-to-oldest SSTables, first hit (incl. tombstone) wins
-- [x] SSTable **block index** + persisted sparse index (64 records per block;
-  one first-key + byte range per block stays resident in memory)
-- [x] **compaction** — full k-way merge of SSTables; combine duplicate version
-  histories and atomically publish the replacement manifest
-- [x] automatic compaction trigger by SSTable count (default `8`, configurable)
-- [x] **bloom filters** persisted with each new SSTable to skip files that
-  definitely cannot contain a key (false positives still use the normal lookup)
-- [x] durable **sequence numbers** + atomic WAL **write batches**
-- [x] immutable read-only **snapshots** at a fixed sequence (copy-on-snapshot)
-- [x] optimistic **write transactions** with read-your-writes, atomic commit, and
-  key-level read/write conflict detection
-- [x] full MVCC storage with per-key versions and historical `get_at`/snapshots
-- [x] MVCC version garbage collection / retention policy (explicit durable
-  sequence boundary)
-- [x] deterministic mixed/MVCC **load tests** and corruption/transaction edge cases
-- [x] reproducible release **performance baseline** for storage, recovery,
-  compaction, disk footprint, and the HTTP router
+The learning-oriented LSM foundation is complete: WAL recovery, versioned
+memtables, indexed and Bloom-filtered SSTables, atomic batches, snapshots,
+optimistic transactions, MVCC retention, compaction, HTTP access, load tests,
+and a local performance baseline are implemented.
+
+The next work is reliability-first: make acknowledged durability real, bound
+recovery and memory use, propagate storage failures correctly, isolate blocking
+I/O from the async server, and make delivery reproducible before adding more
+database features. See the [prioritized roadmap](ROADMAP.md) for the audit
+findings, milestones, and acceptance criteria.
