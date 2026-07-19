@@ -1,6 +1,6 @@
 # kvdb roadmap
 
-Last reviewed: 2026-07-19.
+Last reviewed: 2026-07-20.
 
 kvdb now has a working single-node LSM-style storage engine and its first
 persistence-hardening pass. The immediate goal is to finish corruption and
@@ -16,9 +16,12 @@ checks pass on that toolchain:
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --all --locked` (60 passing tests, 19 intentionally ignored)
 
-The four ignored load tests and 15 ignored performance scenarios remain
-separate release-mode jobs in CI. Docker copies `Cargo.lock`, builds with
-`--locked`, runs as a non-root user, and has a persistence smoke test in CI.
+The four ignored load tests, 15 component microbenchmarks, and the quick
+end-to-end benchmark profile remain separate release-mode jobs in CI. The
+end-to-end harness uses an on-disk directory, explicit durability modes,
+latency percentiles, randomized reads, and real TCP concurrency. Docker copies
+`Cargo.lock`, builds with `--locked`, runs as a non-root user, and has a
+persistence smoke test in CI.
 
 ## Completed hardening
 

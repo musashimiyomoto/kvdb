@@ -1,15 +1,15 @@
-//! Informational performance tests — a zero-dependency micro-benchmark harness
-//! built on [`std::time::Instant`].
+//! Informational component microbenchmarks built on [`std::time::Instant`].
 //!
 //! These are **not** pass/fail assertions on timing (which would be flaky in
 //! CI); they print throughput and latency so you can eyeball regressions and
 //! understand the cost of each operation and of the LSM read path (memtable hit
-//! vs SSTable hit vs miss). They are `#[ignore]`d so `cargo test` stays fast.
+//! vs SSTable hit vs miss). They do not replace the end-to-end benchmark in
+//! `benches/kvdb_bench.rs`. They are `#[ignore]`d so `cargo test` stays fast.
 //!
 //! Run them, in release mode, with output shown:
 //!
 //! ```sh
-//! cargo test --release --test perf -- --ignored --nocapture --test-threads=1
+//! cargo test --release --locked --test perf -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::hint::black_box;
@@ -24,7 +24,14 @@ use kvdb::store::{Store, WriteBatch};
 use tower::ServiceExt;
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
+    let mut p = std::env::var_os("KVDB_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("kvdb-microbench")
+        });
+    std::fs::create_dir_all(&p).unwrap();
     p.push(format!("kvdb-perf-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();

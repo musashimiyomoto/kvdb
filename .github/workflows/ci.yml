@@ -104,7 +104,7 @@ jobs:
 
       # There are deliberately no timing thresholds: shared-runner performance
       # is noisy. Panics and correctness failures still fail this job.
-      - name: Run performance suite sequentially
+      - name: Run component microbenchmarks
         env:
           CARGO_TERM_COLOR: never
           KVDB_DURABILITY: buffered
@@ -113,6 +113,14 @@ jobs:
           cargo test --release --locked --test perf -- \
             --ignored --nocapture --test-threads=1 2>&1 \
             | tee "$RUNNER_TEMP/performance.txt"
+
+      - name: Run end-to-end benchmark
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench kvdb_bench -- --profile quick 2>&1 \
+            | tee -a "$RUNNER_TEMP/performance.txt"
 
       - name: Add metrics to summary
         if: always()
@@ -123,7 +131,7 @@ jobs:
             echo '_Shared-runner results are noisy and do not gate on timing._'
             echo ''
             echo '```text'
-            grep -E 'ops/sec|DURATION|^STORAGE|test result:' \
+            grep -E 'ops/sec|DURATION|^BENCH_|^RESULT|^STORAGE|test result:' \
               "$RUNNER_TEMP/performance.txt" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

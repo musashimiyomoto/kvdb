@@ -15,6 +15,10 @@ path = "src/bin/server.rs"
 name = "kvdb-client"
 path = "src/bin/client.rs"
 
+[[bench]]
+name = "kvdb_bench"
+harness = false
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

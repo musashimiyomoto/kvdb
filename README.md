@@ -68,6 +68,7 @@ cargo test --all --locked  # fast suite: storage engine + HTTP router tests
 # Heavier suites are opt-in (kept out of the default run):
 cargo test --release --locked --test load -- --ignored --nocapture --test-threads=1
 KVDB_DURABILITY=buffered cargo test --release --locked --test perf -- --ignored --nocapture --test-threads=1
+cargo bench --locked --bench kvdb_bench -- --profile standard
 ```
 
 The repository pins Rust 1.96.0 in `rust-toolchain.toml`.
@@ -79,13 +80,19 @@ artifacts for 14 days; benchmark timings appear in the run summary but do not
 gate the build because shared-runner performance is noisy. The workflow can
 also be started manually with `workflow_dispatch`.
 
-## Load tests and performance baseline
+## Load tests and benchmarks
 
-The ignored suites have different jobs. `tests/load.rs` asserts correctness
-under volume, concurrency, repeated reopen, compaction, and MVCC retention;
-timing never decides whether these tests pass. `tests/perf.rs` is an
-informational, dependency-free benchmark harness. Run both in release mode with
-one test thread as shown above so workloads do not compete with each other.
+The performance tooling has three separate jobs:
+
+- `tests/load.rs` asserts correctness under volume, concurrency, repeated
+  reopen, compaction, and MVCC retention. Timing never decides whether it
+  passes.
+- `tests/perf.rs` contains small component microbenchmarks useful for spotting
+  regressions in individual storage paths.
+- `benches/kvdb_bench.rs` is the end-to-end benchmark. It measures explicit
+  buffered and durable writes, durable batches, randomized memtable and warm
+  SSTable reads, WAL recovery, overlapping compaction, and real TCP GET/PUT at
+  several concurrency levels.
 
 Current load suite (all passed in `17.73 s` on the machine described below):
 
@@ -96,51 +103,35 @@ Current load suite (all passed in `17.73 s` on the machine described below):
 | Deterministic mixed | 100k ops, 10k keys, 60% SET / 25% DELETE / 15% GET | Exact match with `BTreeMap` across periodic flush, compaction, and 10 reopens |
 | MVCC + retention | 30k commits over 2k keys + 4k historical probes | Historical reads before GC and retained reads after GC/reopen |
 
-### Local benchmark results
+### End-to-end methodology
 
-Measured on 2026-07-18 under WSL2 (Linux 6.6), Intel Core i5-7200U
-(2 cores / 4 threads), 9.7 GiB RAM, Rust 1.97.1, release `opt-level=3`, with
-temporary files on the WSL filesystem. Values are the median of three complete
-sequential runs. Latency is total elapsed time divided by operation count; it
-is a mean, not a p95/p99. Setup/population is outside the measured interval.
+Run the quick profile while iterating and the standard profile for a report:
 
-| Operation | Dataset | Median throughput | Mean latency |
-|---|---:|---:|---:|
-| SET, individual WAL record + flush | 200k | 180,815 ops/s | 5.531 us/op |
-| SET, atomic batches of 100 | 200k | 190,257 ops/s | 5.256 us/op |
-| DELETE, individual tombstone | 50k | 154,997 ops/s | 6.452 us/op |
-| GET, memtable hit | 100k | 1,869,809 ops/s | 0.535 us/op |
-| GET, one SSTable hit | 100k | 36,333 ops/s | 27.523 us/op |
-| GET miss, 10 Bloom checks | 100k | 245,046 ops/s | 4.081 us/op |
-| Historical `get_at`, 5-version SSTable | 20k | 14,424 ops/s | 69.330 us/op |
-| Flush memtable to one SSTable | 200k records | 610,572 records/s | 1.638 us/record |
-| Full compaction, 10 SSTables to 1 | 100k records | 344,617 records/s | 2.902 us/record |
-| Retention GC | 100k input versions | 720,612 versions/s | 1.388 us/version |
-| WAL recovery | 200k records | 855,672 records/s | 1.169 us/record |
-| Open one 200k-key SSTable | 1 table | - | 57.611 ms total |
-| Materialize copy-on-snapshot | 100k keys | 25,697 keys/s | 38.915 us/key |
-| HTTP GET through Axum router, no TCP | 50k requests | 181,014 req/s | 5.524 us/req |
-| HTTP PUT through Axum router, no TCP | 20k requests | 48,736 req/s | 20.519 us/req |
+```sh
+cargo bench --locked --bench kvdb_bench -- --profile quick
+cargo bench --locked --bench kvdb_bench -- --profile standard
 
-The HTTP rows include routing, Basic auth, body handling, mutex locking, and the
-Store operation, but deliberately exclude socket/network overhead. These
-2026-07-18 figures were collected in the now-explicit `buffered` durability
-mode and must not be read as fsync-level durability latency. The default
-`durable` mode calls `sync_data` for every mutation.
+# Put data on a specific device and retain it for inspection:
+cargo bench --locked --bench kvdb_bench -- \
+  --profile standard --dir /path/on/the/device --keep
+```
 
-Disk footprint from the same runs:
+The default benchmark root is `target/kvdb-bench`, on the same filesystem as
+the repository. On Linux the harness detects the filesystem type and refuses
+`tmpfs`/`ramfs`, because `sync_data` there cannot measure stable-storage
+latency. `--allow-memory-fs` is available only for an explicitly CPU-only run.
 
-| State | Bytes | Normalized size |
-|---|---:|---:|
-| WAL, 200k individual SET records | 9,488,890 | 47.4 B/record |
-| WAL, 200k SETs in batches of 100 | 7,914,890 | 39.6 B/record |
-| One 200k-key SSTable store | 10,651,487 | 53.3 B/record |
-| 100k distinct records before / after full compaction | 5,271,088 / 5,270,251 | 52.7 B/record |
-| 100k MVCC versions before / after retention | 4,926,142 / 1,534,140 | 68.9% reduction |
+Every result reports median throughput across independent samples plus
+p50/p95/p99/max latency. Library-operation latency is sampled to limit timer
+overhead; every TCP request is timed. The output records the profile, path,
+filesystem, Rust version, value size, throughput unit, and latency unit so a
+batch-commit latency cannot be mistaken for per-record latency.
 
-These figures are a regression baseline for this machine, not an SLA. WSL2 I/O
-showed substantial run-to-run variance, which is why the table reports medians
-and keeps the exact reproduction command beside the results.
+SSTable and recovery scenarios are deliberately labeled `warm`: portable cache
+eviction cannot be guaranteed without privileged, platform-specific support.
+CI runs the quick profile only as an informational regression signal. Shared
+runner timings are retained as artifacts but never treated as an SLA or a
+performance gate.
 
 ## Run
 
