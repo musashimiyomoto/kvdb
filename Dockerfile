@@ -8,16 +8,18 @@ WORKDIR /app
 # real sources. This way `cargo` only re-downloads/re-builds deps when
 # Cargo.toml changes, not on every source edit.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src/bin \
+RUN mkdir -p src/bin benches \
     && echo "fn main() {}" > src/bin/server.rs \
     && echo "fn main() {}" > src/bin/client.rs \
+    && echo "fn main() {}" > benches/kvdb_bench.rs \
     && echo "" > src/lib.rs \
     && cargo build --release --locked --bin kvdb-server \
     && rm -rf src
 
 # Now copy the real source and build for real. `touch` bumps the mtimes so
 # cargo's fingerprinting can't mistake the real sources for the stub it just
-# compiled and skip the rebuild.
+# compiled and skip the rebuild. The bench stub remains only to satisfy Cargo's
+# manifest validation; the release image builds and copies the server target.
 COPY src ./src
 RUN touch src/lib.rs src/bin/server.rs src/bin/client.rs \
     && cargo build --release --locked --bin kvdb-server

@@ -48,7 +48,9 @@ impl Profile {
         match self {
             Self::Quick => Workload {
                 samples: 3,
-                durable_writes: 200,
+                durable_writes: 40,
+                durable_batch_records: 500,
+                durable_tcp_writes: 20,
                 buffered_writes: 20_000,
                 read_keys: 20_000,
                 read_ops: 20_000,
@@ -58,7 +60,9 @@ impl Profile {
             },
             Self::Standard => Workload {
                 samples: 5,
-                durable_writes: 2_000,
+                durable_writes: 500,
+                durable_batch_records: 10_000,
+                durable_tcp_writes: 200,
                 buffered_writes: 200_000,
                 read_keys: 100_000,
                 read_ops: 100_000,
@@ -125,6 +129,8 @@ impl Config {
 struct Workload {
     samples: usize,
     durable_writes: usize,
+    durable_batch_records: usize,
+    durable_tcp_writes: usize,
     buffered_writes: usize,
     read_keys: usize,
     read_ops: usize,
@@ -327,7 +333,7 @@ fn bench_writes(run: &RunDirectory, workload: Workload) {
         results.report(name, "records", "record");
     }
 
-    let records = workload.buffered_writes;
+    let records = workload.durable_batch_records;
     let batches = records.div_ceil(BATCH_SIZE);
     let all_keys = keys(records);
     let payload = value(0);
@@ -450,6 +456,26 @@ fn bench_tcp(run: &RunDirectory, workload: Workload) {
                 workload.tcp_ops,
                 concurrency,
                 false,
+                Durability::Buffered,
+                run.keep,
+            ));
+            results.push(measurement, workload.tcp_ops);
+        }
+        results.report(&name, "requests", "request");
+    }
+
+    for concurrency in [1, 8] {
+        let name = format!("tcp_put_buffered_c{concurrency}");
+        let mut results = ResultSet::default();
+        for sample in 0..workload.samples {
+            let dir = run.sample(&name, sample);
+            let measurement = runtime.block_on(tcp_sample(
+                dir,
+                workload.read_keys,
+                workload.tcp_ops,
+                concurrency,
+                true,
+                Durability::Buffered,
                 run.keep,
             ));
             results.push(measurement, workload.tcp_ops);
@@ -465,12 +491,13 @@ fn bench_tcp(run: &RunDirectory, workload: Workload) {
             let measurement = runtime.block_on(tcp_sample(
                 dir,
                 workload.read_keys,
-                workload.durable_writes,
+                workload.durable_tcp_writes,
                 concurrency,
                 true,
+                Durability::Durable,
                 run.keep,
             ));
-            results.push(measurement, workload.durable_writes);
+            results.push(measurement, workload.durable_tcp_writes);
         }
         results.report(&name, "requests", "request");
     }
@@ -482,19 +509,12 @@ async fn tcp_sample(
     requests: usize,
     concurrency: usize,
     write: bool,
+    durability: Durability,
     keep: bool,
 ) -> Measurement {
     let wal = dir.join("kvdb.wal");
     let mut store = Store::open(&wal).expect("open TCP benchmark store");
-    configure_store(
-        &mut store,
-        if write {
-            Durability::Durable
-        } else {
-            Durability::Buffered
-        },
-        true,
-    );
+    configure_store(&mut store, durability, true);
     if !write {
         populate(&mut store, &keys(read_keys), 0);
     }
@@ -515,6 +535,7 @@ async fn tcp_sample(
         .timeout(Duration::from_secs(30))
         .build()
         .expect("build benchmark HTTP client");
+    warm_http_connections(&client, address, concurrency).await;
     let next = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(concurrency + 1));
     let mut workers = Vec::with_capacity(concurrency);
@@ -534,7 +555,7 @@ async fn tcp_sample(
                 let key_index = if write {
                     operation
                 } else {
-                    operation % read_keys
+                    mixed_index(operation, read_keys)
                 };
                 let url = format!("http://{address}/v1/keys/key-{key_index:012}");
                 let start = Instant::now();
@@ -556,8 +577,8 @@ async fn tcp_sample(
         }));
     }
 
-    barrier.wait().await;
     let start = Instant::now();
+    barrier.wait().await;
     let mut latencies_ns = Vec::with_capacity(requests);
     for worker in workers {
         latencies_ns.extend(worker.await.expect("join benchmark HTTP worker"));
@@ -574,6 +595,36 @@ async fn tcp_sample(
         elapsed,
         latencies_ns,
     }
+}
+
+async fn warm_http_connections(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    concurrency: usize,
+) {
+    let mut warmups = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let client = client.clone();
+        warmups.push(tokio::spawn(async move {
+            let response = client
+                .get(format!("http://{address}/health"))
+                .send()
+                .await
+                .expect("warm benchmark HTTP connection");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            black_box(response.bytes().await.expect("read warmup response"));
+        }));
+    }
+    for warmup in warmups {
+        warmup.await.expect("join HTTP connection warmup");
+    }
+}
+
+fn mixed_index(index: usize, upper_bound: usize) -> usize {
+    let mut value = (index as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) % upper_bound as u64) as usize
 }
 
 struct XorShift64(u64);

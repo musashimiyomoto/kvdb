@@ -23,6 +23,35 @@ latency percentiles, randomized reads, and real TCP concurrency. Docker copies
 `Cargo.lock`, builds with `--locked`, runs as a non-root user, and has a
 persistence smoke test in CI.
 
+## Benchmark evidence
+
+The 2026-07-20 quick profile ran three independent samples on the repository's
+ext4-backed WSL volume with 128-byte values. It is diagnostic evidence for
+prioritization, not an SLA or a cross-machine comparison:
+
+| Scenario | Median throughput | Relevant latency |
+|---|---:|---:|
+| Buffered library SET | ~77k records/s | p99 ~89 us |
+| Durable library SET | ~9 records/s | p50 ~77 ms; p99 ~791 ms |
+| Durable batch of 100 | ~1.37k records/s | p50 ~67 ms per batch commit |
+| Random warm SSTable GET | ~32k reads/s | p99 ~155 us |
+| TCP GET, concurrency 8 | ~14k requests/s | p99 ~6.3 ms |
+| Buffered TCP PUT, concurrency 8 | ~3.3k requests/s | p99 ~18.7 ms |
+| Durable TCP PUT, concurrency 8 | ~11 requests/s | p99 ~1.73 s |
+| Overlapping compaction, 50k input versions | ~64k versions/s | p50 ~783 ms total |
+
+The results change the order of work after Milestone 0:
+
+1. Per-mutation fsync dominates durable writes. Group commit is the largest
+   available throughput improvement that can preserve the durability contract.
+2. Blocking storage behind the request-path mutex turns fsync latency into
+   queueing and second-scale tails. A bounded storage worker must precede more
+   HTTP features.
+3. Warm SSTable lookup still reopens and seeks the file for every positive hit;
+   a bounded file-handle/block cache is justified before adding read APIs.
+4. Inline all-memory compaction already causes visible pauses on a small input;
+   moving it out of the request path is P1, while leveled policy remains P2.
+
 ## Completed hardening
 
 The following findings from the original audit are implemented. Storage
@@ -55,13 +84,14 @@ because file formats still lack checksums and crash-point coverage.
 |---|---|---|---|
 | R2 | P0 | Partial | WAL records are not versioned, length-delimited frames and have no checksum; crash/failpoint tests do not yet exercise every write boundary. |
 | R7 | P0 | Partial | WAL records, SSTable blocks, and manifest metadata have no integrity checksums or documented format-migration path. |
-| R8 | P1 | Open | Axum handlers hold `std::sync::Mutex<Store>` during blocking filesystem I/O, so a slow disk can block request workers. |
+| R8 | P1 | Open | Axum handlers hold `std::sync::Mutex<Store>` during blocking I/O. Durable TCP PUT p99 reaches ~1.73 s at concurrency 8. |
 | R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` URLs even though reqwest is built without TLS. |
 | R10 | P1 | Open | One-shot client commands print HTTP errors but still exit successfully, and response values are always decoded as text. |
 | R11 | P1 | Open | The REST API exposes UTF-8 path keys and an implicit Axum body limit, while the library accepts binary keys and values up to its own limits. |
 | R12 | P1 | Partial | GitHub Actions still use mutable version tags; dependency policy, vulnerability scanning, SBOM generation, and image metadata remain open. |
-| R13 | P2 | Open | Full compaction materializes all live SSTables in memory and runs inline with the triggering write. |
+| R13 | P1 | Open | Full compaction materializes all live SSTables and runs inline; even the 50k-version quick case takes ~0.8 s median. |
 | R14 | P2 | Open | There is no readiness probe, graceful shutdown, metrics, backup, verify, or repair command. |
+| R15 | P1 | Open | Every positive SSTable lookup reopens the file and scans a block; there is no bounded file-handle or block cache. |
 
 ## Milestone 0: trustworthy persistence (P0, in progress)
 
@@ -97,22 +127,52 @@ and an uncertain write prevents all later writes until reopen/recovery.
 
 ## Milestone 1: production-safe service boundary (P1)
 
-### 1.1 Isolate blocking storage work
+### 1.1 Fix durable write queueing first
 
 - Give one dedicated blocking worker ownership of `Store` and communicate
   through a bounded request queue with cancellation and overload responses.
-- Add optional group commit so concurrent durable writes can share an fsync
-  without weakening the selected durability mode.
+- Add group commit with explicit maximum batch size and delay so concurrent
+  durable writes share an fsync without acknowledging any member before the
+  whole group is stable.
+- Instrument group size, queue wait, WAL write, fsync, and end-to-end commit
+  latency. Keep individual and batch API semantics distinguishable.
+- Add deterministic tests for partial group failure, cancellation before and
+  after WAL submission, queue saturation, and shutdown with queued commits.
+
+Acceptance: slow-disk tests do not block unrelated Tokio tasks; memory and
+queue depth remain bounded; overload receives an explicit response; one fsync
+can acknowledge multiple concurrent commits; and crash tests prove no response
+is acknowledged before its group is durable.
+
+### 1.2 Bound read and compaction stalls
+
+- Add bounded file-handle and SSTable block caches with observable hit/miss and
+  eviction counts. Keep the uncached path available to benchmark correctness.
+- Replace all-memory compaction with a streaming k-way merge and bounded
+  buffers. Run it in the storage worker/background executor with foreground
+  write backpressure and crash-safe publication.
+- Separate compaction scheduling from the SSTable-count check performed by a
+  foreground write. Report compaction bytes, duration, and write stalls.
+- Keep randomized warm-cache and overlapping-compaction scenarios in the
+  standard benchmark profile; add larger controlled-runner datasets before
+  setting performance gates.
+
+Acceptance: repeated warm SSTable reads reuse open files/blocks; compaction
+memory is bounded independently of database size; and no request executes the
+full compaction inline. p95/p99 changes are reported against a stored controlled
+runner baseline rather than a shared-CI threshold.
+
+### 1.3 Add service lifecycle and limits
+
 - Split `/live` from `/ready`; readiness must fail while recovery is incomplete,
   storage is poisoned, or the queue remains saturated.
 - Add connection, request-body, key/value, concurrency, and request timeout
   limits, plus graceful SIGTERM/SIGINT draining.
 
-Acceptance: slow-disk tests do not block unrelated Tokio tasks, overload stays
-bounded and observable, and shutdown either completes accepted work or clearly
-rejects it.
+Acceptance: readiness reflects storage/queue state, limits fail predictably,
+and shutdown either completes accepted work or clearly rejects it.
 
-### 1.2 Define the HTTP and client contracts
+### 1.4 Define the HTTP and client contracts
 
 - Choose a binary-key representation such as base64url, or explicitly define
   the REST API as UTF-8-only. Preserve raw value bytes and publish exact limits.
@@ -129,7 +189,7 @@ rejects it.
 Acceptance: TCP-level tests cover binary data, limits, status/exit-code mapping,
 timeouts, the TLS policy, and server restart behavior.
 
-### 1.3 Secure delivery
+### 1.5 Secure delivery
 
 - Pin GitHub Actions by commit SHA and add dependency/license policy,
   vulnerability scanning, and scheduled dependency updates.
@@ -143,13 +203,11 @@ dependency/image scans have no untriaged high-severity findings.
 
 ## Milestone 2: predictable storage at scale (P2)
 
-- Replace all-in-memory full compaction with a streaming k-way merge and bounded
-  buffers. Run compaction outside the request path with write backpressure and
-  crash-safe publication.
 - Move from an SSTable-count trigger to size-aware tiered or leveled compaction
   with explicit write- and space-amplification targets.
-- Add bounded block and file-handle caches. Measure Bloom false-positive rate,
-  read amplification, cache hit rate, and p50/p95/p99 latency.
+- Tune cache sizing and compaction using Bloom false-positive rate, read
+  amplification, cache hit rate, and p50/p95/p99 latency from a controlled
+  runner.
 - Make snapshots and transactions lazy or structurally shared so beginning a
   transaction does not copy the whole visible database.
 - Add prefix/range iteration primitives needed by backup and future APIs.
