@@ -360,15 +360,23 @@ fn bench_writes(run: &RunDirectory, workload: Workload) {
 
 fn bench_reads(run: &RunDirectory, workload: Workload) {
     let all_keys = keys(workload.read_keys);
-    for (name, flush) in [
-        ("get_memtable_random", false),
-        ("get_sstable_warm_random", true),
+    for (name, flush, cache_limits) in [
+        ("get_memtable_random", false, None),
+        ("get_sstable_warm_uncached_random", true, Some((0, 0))),
+        (
+            "get_sstable_warm_cached_random",
+            true,
+            Some((64, 64 * 1024 * 1024)),
+        ),
     ] {
         let mut results = ResultSet::default();
         for sample in 0..workload.samples {
             let dir = run.sample(name, sample);
             let mut store = Store::open(dir.join("kvdb.wal")).expect("open read benchmark store");
             configure_store(&mut store, Durability::Buffered, true);
+            if let Some((file_capacity, block_bytes)) = cache_limits {
+                store.set_sstable_cache_limits(file_capacity, block_bytes);
+            }
             populate(&mut store, &all_keys, 0);
             if flush {
                 store.flush().expect("flush read benchmark store");
@@ -383,6 +391,23 @@ fn bench_reads(run: &RunDirectory, workload: Workload) {
                 let index = random.next_usize(workload.read_keys);
                 black_box(store.get(&all_keys[index]).expect("benchmark GET"));
             });
+            if flush {
+                let cache = store.sstable_cache_metrics();
+                println!(
+                    "SSTABLE_CACHE name={name:?} sample={sample} file_hits={} file_misses={} \
+                     file_evictions={} open_files={} block_hits={} block_misses={} \
+                     block_evictions={} resident_blocks={} resident_bytes={}",
+                    cache.file_hits,
+                    cache.file_misses,
+                    cache.file_evictions,
+                    cache.open_files,
+                    cache.block_hits,
+                    cache.block_misses,
+                    cache.block_evictions,
+                    cache.resident_blocks,
+                    cache.resident_bytes
+                );
+            }
             drop(store);
             run.clean_sample(&dir);
             results.push(measurement, workload.read_ops);
@@ -519,7 +544,8 @@ async fn tcp_sample(
         populate(&mut store, &keys(read_keys), 0);
     }
 
-    let app = router(AppState::new(store, "admin", "secret"));
+    let state = AppState::new(store, "admin", "secret");
+    let app = router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind TCP benchmark server");
@@ -586,6 +612,15 @@ async fn tcp_sample(
     let elapsed = start.elapsed();
     server.abort();
     let _ = server.await;
+
+    if write {
+        let metrics = state.storage_metrics();
+        println!(
+            "GROUP_COMMIT durability={durability:?} concurrency={concurrency} \
+             requests={requests} groups={} max_group_size={} queue_full={}",
+            metrics.write_groups, metrics.max_group_size, metrics.queue_full
+        );
+    }
 
     if !keep {
         fs::remove_dir_all(&dir).expect("remove TCP benchmark sample directory");
@@ -710,8 +745,9 @@ fn main() {
         workload.samples
     );
     println!(
-        "BENCH_NOTE SSTable and recovery reads are warm-cache measurements; \
-         shared-runner results are informational, not an SLA"
+        "BENCH_NOTE SSTable and recovery reads use a warm OS page cache; SSTable point reads \
+         report explicit application-cache enabled/disabled scenarios; shared-runner results \
+         are informational, not an SLA"
     );
 
     bench_writes(&run, workload);

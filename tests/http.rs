@@ -4,11 +4,12 @@
 //! socket is bound, so the tests are fast and deterministic.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use kvdb::http::{AppState, router};
+use kvdb::http::{AppState, StorageOptions, router};
 use kvdb::store::Store;
 use tower::ServiceExt; // for `oneshot`
 
@@ -108,6 +109,50 @@ async fn put_get_delete_roundtrip() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_puts_share_group_commits() {
+    let path = tmp_path("group-commit");
+    let store = Store::open(&path).unwrap();
+    let state = AppState::with_storage_options(
+        store,
+        USER,
+        PASS,
+        StorageOptions {
+            queue_capacity: 128,
+            group_commit_max: 64,
+            group_commit_delay: Duration::from_millis(20),
+        },
+    );
+    let auth = basic(USER, PASS);
+    let mut requests = Vec::new();
+    for index in 0..32 {
+        let state = state.clone();
+        let auth = auth.clone();
+        requests.push(tokio::spawn(async move {
+            send(
+                &state,
+                "PUT",
+                &format!("/v1/keys/key-{index}"),
+                Some(&auth),
+                "value",
+            )
+            .await
+        }));
+    }
+    for request in requests {
+        assert_eq!(request.await.unwrap().0, StatusCode::OK);
+    }
+
+    let metrics = state.storage_metrics();
+    assert_eq!(metrics.logical_writes, 32);
+    assert!(metrics.max_group_size > 1);
+    assert!(metrics.write_groups < metrics.logical_writes);
+
+    drop(state);
+    std::fs::remove_file(path.with_extension("wal.lock")).ok();
+    std::fs::remove_file(path).ok();
 }
 
 #[tokio::test]

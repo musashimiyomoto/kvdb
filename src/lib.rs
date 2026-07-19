@@ -12,7 +12,8 @@ pub mod log;
 pub mod sstable;
 pub mod store;
 
-pub use http::{AppState, router};
+pub use http::{AppState, StorageMetrics, StorageOptions, router};
+pub use sstable::SsTableCacheMetrics;
 pub use store::{
     BatchOperation, Durability, Snapshot, Store, Transaction, TransactionError, WriteBatch,
 };

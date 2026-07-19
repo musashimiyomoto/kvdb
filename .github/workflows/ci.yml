@@ -131,7 +131,7 @@ jobs:
             echo '_Shared-runner results are noisy and do not gate on timing._'
             echo ''
             echo '```text'
-            grep -E 'ops/sec|DURATION|^BENCH_|^RESULT|^STORAGE|test result:' \
+            grep -E 'ops/sec|DURATION|^BENCH_|^RESULT|^STORAGE|^GROUP_COMMIT|^SSTABLE_CACHE|test result:' \
               "$RUNNER_TEMP/performance.txt" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

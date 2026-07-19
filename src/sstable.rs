@@ -32,9 +32,12 @@
 //! are not all retained in memory.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::limits::{
     MAX_BLOOM_FILTER_BYTES, MAX_BLOOM_HASHES, MAX_KEY_BYTES, MAX_SSTABLE_RECORD_BYTES,
@@ -54,6 +57,11 @@ const FOOTER_LEN: u64 = 16;
 const RECORDS_PER_BLOCK: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 10;
 const BLOOM_HASHES: u8 = 7;
+const DEFAULT_FILE_CACHE_CAPACITY: usize = 64;
+const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+type BlockEntries = Vec<(Vec<u8>, Vec<VersionedValue>)>;
+type SharedBlockEntries = Arc<BlockEntries>;
 
 /// A value stored for a key: either live bytes, or a tombstone marking a delete.
 ///
@@ -72,6 +80,299 @@ pub enum Value {
 pub struct VersionedValue {
     pub sequence: u64,
     pub value: Value,
+}
+
+/// Point-in-time counters and residency for one Store's SSTable caches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SsTableCacheMetrics {
+    pub file_hits: u64,
+    pub file_misses: u64,
+    pub file_evictions: u64,
+    pub open_files: usize,
+    pub block_hits: u64,
+    pub block_misses: u64,
+    pub block_evictions: u64,
+    pub resident_blocks: usize,
+    pub resident_bytes: usize,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct BlockCacheKey {
+    path: PathBuf,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug)]
+struct CachedFile {
+    file: File,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct CachedBlock {
+    entries: SharedBlockEntries,
+    charge: usize,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct SsTableCacheInner {
+    file_capacity: usize,
+    block_capacity_bytes: usize,
+    files: HashMap<PathBuf, CachedFile>,
+    blocks: HashMap<BlockCacheKey, CachedBlock>,
+    block_bytes: usize,
+    clock: u64,
+    metrics: SsTableCacheMetrics,
+}
+
+/// Shared cache for the immutable tables owned by one Store.
+#[derive(Debug)]
+pub(crate) struct SsTableCache {
+    inner: Mutex<SsTableCacheInner>,
+}
+
+impl SsTableCache {
+    pub(crate) fn from_env() -> Arc<Self> {
+        Arc::new(Self::new(
+            usize_env(
+                "KVDB_SSTABLE_FILE_CACHE_CAPACITY",
+                DEFAULT_FILE_CACHE_CAPACITY,
+            ),
+            usize_env("KVDB_SSTABLE_BLOCK_CACHE_BYTES", DEFAULT_BLOCK_CACHE_BYTES),
+        ))
+    }
+
+    fn new(file_capacity: usize, block_capacity_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(SsTableCacheInner {
+                file_capacity,
+                block_capacity_bytes,
+                files: HashMap::new(),
+                blocks: HashMap::new(),
+                block_bytes: 0,
+                clock: 0,
+                metrics: SsTableCacheMetrics::default(),
+            }),
+        }
+    }
+
+    pub(crate) fn configure(&self, file_capacity: usize, block_capacity_bytes: usize) {
+        let mut inner = self.lock();
+        inner.file_capacity = file_capacity;
+        inner.block_capacity_bytes = block_capacity_bytes;
+        inner.enforce_limits();
+    }
+
+    pub(crate) fn metrics(&self) -> SsTableCacheMetrics {
+        let inner = self.lock();
+        SsTableCacheMetrics {
+            open_files: inner.files.len(),
+            resident_blocks: inner.blocks.len(),
+            resident_bytes: inner.block_bytes,
+            ..inner.metrics
+        }
+    }
+
+    pub(crate) fn invalidate(&self, path: &Path) {
+        let mut inner = self.lock();
+        inner.files.remove(path);
+        let retired = inner
+            .blocks
+            .keys()
+            .filter(|key| key.path == path)
+            .map(|key| (key.path.clone(), key.start, key.end))
+            .collect::<Vec<_>>();
+        for (path, start, end) in retired {
+            if let Some(block) = inner.blocks.remove(&BlockCacheKey { path, start, end }) {
+                inner.block_bytes = inner.block_bytes.saturating_sub(block.charge);
+            }
+        }
+    }
+
+    fn insert_open_file(&self, path: &Path, file: File) {
+        let mut inner = self.lock();
+        inner.insert_file(path.to_path_buf(), file);
+    }
+
+    fn version_at(
+        &self,
+        path: &Path,
+        block: &BlockIndex,
+        key: &[u8],
+        sequence: u64,
+    ) -> io::Result<Option<VersionedValue>> {
+        let cache_key = BlockCacheKey {
+            path: path.to_path_buf(),
+            start: block.start,
+            end: block.end,
+        };
+        let mut inner = self.lock();
+        inner.clock = inner.clock.wrapping_add(1);
+        let now = inner.clock;
+        if let Some(cached) = inner.blocks.get_mut(&cache_key) {
+            cached.last_used = now;
+            let entries = Arc::clone(&cached.entries);
+            inner.metrics.block_hits = inner.metrics.block_hits.saturating_add(1);
+            return Ok(find_version(&entries, key, sequence));
+        }
+
+        inner.metrics.block_misses = inner.metrics.block_misses.saturating_add(1);
+        let cache_limit = u64::try_from(inner.block_capacity_bytes).unwrap_or(u64::MAX);
+        if inner.block_capacity_bytes == 0 || block.end - block.start > cache_limit {
+            return inner.scan_version(path, block, key, sequence);
+        }
+        let bytes = inner.read_range(path, block.start, block.end)?;
+        let entries = Arc::new(decode_block(block, &bytes)?);
+        let charge = decoded_block_charge(&entries);
+        inner.insert_block(cache_key, Arc::clone(&entries), charge);
+        Ok(find_version(&entries, key, sequence))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SsTableCacheInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl SsTableCacheInner {
+    fn scan_version(
+        &mut self,
+        path: &Path,
+        block: &BlockIndex,
+        key: &[u8],
+        sequence: u64,
+    ) -> io::Result<Option<VersionedValue>> {
+        if self.file_capacity == 0 {
+            self.metrics.file_misses = self.metrics.file_misses.saturating_add(1);
+            let mut file = File::open(path)?;
+            return scan_block_version(&mut file, block, key, sequence);
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+        let now = self.clock;
+        if !self.files.contains_key(path) {
+            self.metrics.file_misses = self.metrics.file_misses.saturating_add(1);
+            let file = File::open(path)?;
+            self.insert_file(path.to_path_buf(), file);
+        } else {
+            self.metrics.file_hits = self.metrics.file_hits.saturating_add(1);
+        }
+        let cached = self.files.get_mut(path).expect("file was inserted");
+        cached.last_used = now;
+        scan_block_version(&mut cached.file, block, key, sequence)
+    }
+
+    fn read_range(&mut self, path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        let length = usize::try_from(end.saturating_sub(start))
+            .map_err(|_| invalid_data("SSTable block is too large"))?;
+        let mut bytes = vec![0; length];
+
+        if self.file_capacity == 0 {
+            self.metrics.file_misses = self.metrics.file_misses.saturating_add(1);
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut bytes)?;
+            return Ok(bytes);
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+        let now = self.clock;
+        if !self.files.contains_key(path) {
+            self.metrics.file_misses = self.metrics.file_misses.saturating_add(1);
+            let file = File::open(path)?;
+            self.insert_file(path.to_path_buf(), file);
+        } else {
+            self.metrics.file_hits = self.metrics.file_hits.saturating_add(1);
+        }
+        let cached = self.files.get_mut(path).expect("file was inserted");
+        cached.last_used = now;
+        cached.file.seek(SeekFrom::Start(start))?;
+        cached.file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn insert_file(&mut self, path: PathBuf, file: File) {
+        if self.file_capacity == 0 {
+            return;
+        }
+        if self.files.contains_key(&path) {
+            return;
+        }
+        while self.files.len() >= self.file_capacity {
+            self.evict_file();
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.files.insert(
+            path,
+            CachedFile {
+                file,
+                last_used: self.clock,
+            },
+        );
+    }
+
+    fn insert_block(&mut self, key: BlockCacheKey, entries: SharedBlockEntries, charge: usize) {
+        if self.block_capacity_bytes == 0 || charge > self.block_capacity_bytes {
+            return;
+        }
+        while self.block_bytes.saturating_add(charge) > self.block_capacity_bytes {
+            self.evict_block();
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.blocks.insert(
+            key,
+            CachedBlock {
+                entries,
+                charge,
+                last_used: self.clock,
+            },
+        );
+        self.block_bytes = self.block_bytes.saturating_add(charge);
+    }
+
+    fn enforce_limits(&mut self) {
+        while self.files.len() > self.file_capacity {
+            self.evict_file();
+        }
+        while self.block_bytes > self.block_capacity_bytes {
+            self.evict_block();
+        }
+    }
+
+    fn evict_file(&mut self) {
+        let Some(path) = self
+            .files
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(path, _)| path.clone())
+        else {
+            return;
+        };
+        self.files.remove(&path);
+        self.metrics.file_evictions = self.metrics.file_evictions.saturating_add(1);
+    }
+
+    fn evict_block(&mut self) {
+        let Some(key) = self
+            .blocks
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| BlockCacheKey {
+                path: key.path.clone(),
+                start: key.start,
+                end: key.end,
+            })
+        else {
+            return;
+        };
+        if let Some(block) = self.blocks.remove(&key) {
+            self.block_bytes = self.block_bytes.saturating_sub(block.charge);
+            self.metrics.block_evictions = self.metrics.block_evictions.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -131,6 +432,7 @@ pub struct SsTable {
     blocks: Vec<BlockIndex>,
     bloom: BloomFilter,
     len: usize,
+    cache: Arc<SsTableCache>,
 }
 
 impl SsTable {
@@ -204,6 +506,10 @@ impl SsTable {
 
     /// Opens an existing table and loads its sparse index and Bloom filter.
     pub fn open(path: &Path) -> io::Result<SsTable> {
+        Self::open_with_cache(path, SsTableCache::from_env())
+    }
+
+    pub(crate) fn open_with_cache(path: &Path, cache: Arc<SsTableCache>) -> io::Result<SsTable> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; FILE_MAGIC.len()];
         file.read_exact(&mut magic)?;
@@ -211,12 +517,14 @@ impl SsTable {
             return Err(invalid_data("invalid SSTable file magic"));
         }
         let (blocks, bloom, len) = read_index(&mut file)?;
+        cache.insert_open_file(path, file);
 
         Ok(SsTable {
             path: path.to_path_buf(),
             blocks,
             bloom,
             len,
+            cache,
         })
     }
 
@@ -248,34 +556,8 @@ impl SsTable {
         else {
             return Ok(None);
         };
-        let block = &self.blocks[block_pos];
-
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(block.start))?;
-        let mut reader = BufReader::new(file.take(block.end - block.start));
-        let mut previous_key: Option<Vec<u8>> = None;
-        let mut records_read = 0usize;
-
-        while let Some((record_key, versions)) = read_record(&mut reader)? {
-            validate_block_record(block, &record_key, previous_key.as_deref(), records_read)?;
-            records_read += 1;
-            match record_key.as_slice().cmp(key) {
-                Ordering::Less => previous_key = Some(record_key),
-                Ordering::Equal => {
-                    return Ok(versions
-                        .into_iter()
-                        .rev()
-                        .find(|version| version.sequence <= sequence));
-                }
-                Ordering::Greater => return Ok(None),
-            }
-        }
-        if records_read != block.records {
-            return Err(invalid_data(
-                "SSTable block record count does not match index",
-            ));
-        }
-        Ok(None)
+        self.cache
+            .version_at(&self.path, &self.blocks[block_pos], key, sequence)
     }
 
     /// Reads every record in ascending key order. This is intentionally a disk
@@ -494,6 +776,98 @@ fn validate_block_record(
         return Err(invalid_data("SSTable block keys are not strictly ordered"));
     }
     Ok(())
+}
+
+fn decode_block(block: &BlockIndex, bytes: &[u8]) -> io::Result<BlockEntries> {
+    let mut reader = Cursor::new(bytes);
+    let mut entries = Vec::with_capacity(block.records);
+    let mut previous_key: Option<Vec<u8>> = None;
+    while let Some((key, versions)) = read_record(&mut reader)? {
+        validate_block_record(block, &key, previous_key.as_deref(), entries.len())?;
+        previous_key = Some(key.clone());
+        entries.push((key, versions));
+    }
+    if entries.len() != block.records {
+        return Err(invalid_data(
+            "SSTable block record count does not match index",
+        ));
+    }
+    Ok(entries)
+}
+
+fn find_version(
+    entries: &[(Vec<u8>, Vec<VersionedValue>)],
+    key: &[u8],
+    sequence: u64,
+) -> Option<VersionedValue> {
+    let record_pos = entries
+        .binary_search_by(|(record_key, _)| record_key.as_slice().cmp(key))
+        .ok()?;
+    entries[record_pos]
+        .1
+        .iter()
+        .rev()
+        .find(|version| version.sequence <= sequence)
+        .cloned()
+}
+
+fn scan_block_version(
+    file: &mut File,
+    block: &BlockIndex,
+    key: &[u8],
+    sequence: u64,
+) -> io::Result<Option<VersionedValue>> {
+    file.seek(SeekFrom::Start(block.start))?;
+    let mut reader = BufReader::new(file.take(block.end - block.start));
+    let mut previous_key: Option<Vec<u8>> = None;
+    let mut records_read = 0usize;
+
+    while let Some((record_key, versions)) = read_record(&mut reader)? {
+        validate_block_record(block, &record_key, previous_key.as_deref(), records_read)?;
+        records_read += 1;
+        match record_key.as_slice().cmp(key) {
+            Ordering::Less => previous_key = Some(record_key),
+            Ordering::Equal => {
+                return Ok(versions
+                    .into_iter()
+                    .rev()
+                    .find(|version| version.sequence <= sequence));
+            }
+            Ordering::Greater => return Ok(None),
+        }
+    }
+    if records_read != block.records {
+        return Err(invalid_data(
+            "SSTable block record count does not match index",
+        ));
+    }
+    Ok(None)
+}
+
+fn decoded_block_charge(entries: &[(Vec<u8>, Vec<VersionedValue>)]) -> usize {
+    let mut bytes = entries
+        .len()
+        .saturating_mul(size_of::<(Vec<u8>, Vec<VersionedValue>)>());
+    for (key, versions) in entries {
+        bytes = bytes.saturating_add(key.capacity()).saturating_add(
+            versions
+                .capacity()
+                .saturating_mul(size_of::<VersionedValue>()),
+        );
+        for version in versions {
+            if let Value::Set(value) = &version.value {
+                bytes = bytes.saturating_add(value.capacity());
+            }
+        }
+    }
+    bytes
+}
+
+fn usize_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 /// The temp path a table is staged at before being renamed into place.
@@ -875,6 +1249,55 @@ mod tests {
         assert_eq!(sst.get(b"key-0063x").unwrap(), None);
         assert_eq!(sst.get(b"aaa").unwrap(), None);
         assert_eq!(sst.get(b"zzz").unwrap(), None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_and_block_caches_hit_and_respect_limits() {
+        let path = tmp("cache-bounds");
+        let entries: Vec<(Vec<u8>, Vec<VersionedValue>)> = (0..(RECORDS_PER_BLOCK * 3))
+            .map(|i| {
+                (
+                    format!("key-{i:04}").into_bytes(),
+                    version(i as u64 + 1, Value::Set(vec![b'v'; 16])),
+                )
+            })
+            .collect();
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
+        )
+        .unwrap();
+
+        let cache = Arc::new(SsTableCache::new(1, usize::MAX));
+        let sst = SsTable::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        assert!(sst.get(b"key-0000").unwrap().is_some());
+        assert!(sst.get(b"key-0001").unwrap().is_some());
+        let first = cache.metrics();
+        assert_eq!(first.block_misses, 1);
+        assert_eq!(first.block_hits, 1);
+        assert_eq!(first.open_files, 1);
+        assert_eq!(first.resident_blocks, 1);
+
+        cache.configure(1, first.resident_bytes);
+        assert!(sst.get(b"key-0064").unwrap().is_some());
+        let bounded = cache.metrics();
+        assert_eq!(bounded.resident_blocks, 1);
+        assert!(bounded.resident_bytes <= first.resident_bytes);
+        assert_eq!(bounded.block_evictions, 1);
+
+        cache.configure(0, 0);
+        let before_uncached = cache.metrics();
+        assert!(sst.get(b"key-0128").unwrap().is_some());
+        assert!(sst.get(b"key-0129").unwrap().is_some());
+        let uncached = cache.metrics();
+        assert_eq!(uncached.open_files, 0);
+        assert_eq!(uncached.resident_blocks, 0);
+        assert_eq!(uncached.file_misses - before_uncached.file_misses, 2);
+        assert_eq!(uncached.block_misses - before_uncached.block_misses, 2);
 
         std::fs::remove_file(&path).ok();
     }

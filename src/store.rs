@@ -19,9 +19,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::limits::{MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES};
-use crate::sstable::{SsTable, Value, VersionedValue};
+use crate::sstable::{SsTable, SsTableCache, SsTableCacheMetrics, Value, VersionedValue};
 use crate::{log_debug, log_info, log_warn};
 
 /// WAL operation codes.
@@ -217,6 +218,8 @@ pub struct Store {
     wal_path: PathBuf,
     /// Live SSTables, oldest first. Reads scan this in reverse (newest first).
     sstables: Vec<SsTable>,
+    /// Shared bounded file-handle and decoded-block cache for live SSTables.
+    sstable_cache: Arc<SsTableCache>,
     /// Sequence number for the next SSTable file.
     next_seq: u64,
     /// Sequence number of the latest committed mutation or batch.
@@ -273,9 +276,10 @@ impl Store {
         let manifest = read_manifest(&manifest_path)?;
         let sstable_names = manifest.sstables;
         let dir = parent_dir(&wal_path);
+        let sstable_cache = SsTableCache::from_env();
         let mut sstables = Vec::with_capacity(sstable_names.len());
         for name in &sstable_names {
-            let sst = SsTable::open(&dir.join(name))?;
+            let sst = SsTable::open_with_cache(&dir.join(name), Arc::clone(&sstable_cache))?;
             sstables.push(sst);
         }
         let next_seq = next_seq_from(&sstable_names);
@@ -304,6 +308,7 @@ impl Store {
             _lock: lock,
             wal_path,
             sstables,
+            sstable_cache,
             next_seq,
             sequence,
             durable_sequence: manifest.sequence,
@@ -457,6 +462,54 @@ impl Store {
         Ok(sequence)
     }
 
+    /// Commits multiple logical batches with one WAL flush and durability sync.
+    ///
+    /// Every non-empty batch remains a separate WAL record and receives its own
+    /// monotonically increasing sequence. All input is validated before any WAL
+    /// bytes are written, and no memtable mutation is applied until the complete
+    /// group has been flushed (and synced in [`Durability::Durable`] mode).
+    pub fn write_group(&mut self, batches: Vec<WriteBatch>) -> io::Result<Vec<u64>> {
+        self.ensure_writable()?;
+        for batch in &batches {
+            if !batch.is_empty() {
+                validate_batch(&batch.operations, io::ErrorKind::InvalidInput)?;
+            }
+        }
+
+        let mut next_sequence = self.sequence;
+        let mut sequences = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            if !batch.is_empty() {
+                next_sequence = next_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("commit sequence exhausted"))?;
+            }
+            sequences.push(next_sequence);
+        }
+
+        if next_sequence == self.sequence {
+            return Ok(sequences);
+        }
+
+        self.persist_wal(|wal| {
+            for (batch, &sequence) in batches.iter().zip(&sequences) {
+                if !batch.is_empty() {
+                    write_batch(wal, sequence, &batch.operations)?;
+                }
+            }
+            Ok(())
+        })?;
+
+        for (batch, sequence) in batches.into_iter().zip(sequences.iter().copied()) {
+            for operation in batch.operations {
+                self.apply_memtable_operation(sequence, operation);
+            }
+        }
+        self.sequence = next_sequence;
+        self.maybe_flush()?;
+        Ok(sequences)
+    }
+
     fn next_sequence(&self) -> io::Result<u64> {
         self.sequence
             .checked_add(1)
@@ -574,7 +627,10 @@ impl Store {
 
         // 4. Adopt the new table and reset the memtable.
         let flushed = self.memtable.len();
-        self.sstables.push(SsTable::open(&sst_path)?);
+        self.sstables.push(SsTable::open_with_cache(
+            &sst_path,
+            Arc::clone(&self.sstable_cache),
+        )?);
         self.next_seq += 1;
         self.memtable.clear();
         self.memtable_bytes = 0;
@@ -679,7 +735,7 @@ impl Store {
                     .iter()
                     .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
             )?;
-            let table = SsTable::open(&path)?;
+            let table = SsTable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
             Some((name, table))
         };
 
@@ -699,7 +755,9 @@ impl Store {
             if Some(old_name.as_str()) == replacement_name {
                 continue;
             }
-            if let Err(e) = std::fs::remove_file(dir.join(old_name)) {
+            let old_path = dir.join(old_name);
+            self.sstable_cache.invalidate(&old_path);
+            if let Err(e) = std::fs::remove_file(old_path) {
                 log_warn!(
                     TARGET,
                     "could not remove superseded SSTable {old_name}: {e}"
@@ -827,6 +885,16 @@ impl Store {
     /// Number of SSTables currently live (flushed and recorded in the manifest).
     pub fn sstable_count(&self) -> usize {
         self.sstables.len()
+    }
+
+    /// Overrides cache bounds. Zero disables the corresponding cache.
+    pub fn set_sstable_cache_limits(&mut self, file_capacity: usize, block_bytes: usize) {
+        self.sstable_cache.configure(file_capacity, block_bytes);
+    }
+
+    /// Current SSTable cache counters and resident resource usage.
+    pub fn sstable_cache_metrics(&self) -> SsTableCacheMetrics {
+        self.sstable_cache.metrics()
     }
 
     /// Sequence number of the latest committed mutation or atomic batch.

@@ -377,8 +377,16 @@ fn compaction_keeps_current_values_and_historical_versions() {
     s.flush().unwrap();
     assert_eq!(s.sstable_count(), 2);
 
+    assert_eq!(s.get(b"updated").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"stable").unwrap(), Some(b"kept".to_vec()));
+    assert!(s.sstable_cache_metrics().resident_blocks >= 2);
+
     s.compact().unwrap();
     assert_eq!(s.sstable_count(), 1);
+    let cache = s.sstable_cache_metrics();
+    assert_eq!(cache.open_files, 1);
+    assert_eq!(cache.resident_blocks, 0);
+    assert_eq!(cache.resident_bytes, 0);
     assert_eq!(s.get(b"updated").unwrap(), Some(b"new".to_vec()));
     assert_eq!(s.get(b"deleted").unwrap(), None);
     assert_eq!(s.get(b"stable").unwrap(), Some(b"kept".to_vec()));
@@ -613,6 +621,52 @@ fn atomic_batch_applies_in_order_with_one_sequence_number() {
     assert_eq!(s.current_sequence(), 1);
     assert_eq!(s.get(b"a").unwrap(), Some(b"last".to_vec()));
     assert_eq!(s.get(b"b").unwrap(), Some(b"second".to_vec()));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_group_assigns_one_sequence_per_logical_batch() {
+    let path = tmp_path("write-group");
+    let mut store = Store::open(&path).unwrap();
+    let mut first = WriteBatch::new();
+    first.set(b"key".to_vec(), b"one".to_vec());
+    let mut second = WriteBatch::new();
+    second.set(b"key".to_vec(), b"two".to_vec());
+    let empty = WriteBatch::new();
+
+    assert_eq!(
+        store.write_group(vec![first, empty, second]).unwrap(),
+        vec![1, 1, 2]
+    );
+    assert_eq!(store.current_sequence(), 2);
+    assert_eq!(store.get_at(b"key", 1).unwrap(), Some(b"one".to_vec()));
+    assert_eq!(store.get(b"key").unwrap(), Some(b"two".to_vec()));
+
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.current_sequence(), 2);
+    assert_eq!(store.get_at(b"key", 1).unwrap(), Some(b"one".to_vec()));
+    assert_eq!(store.get(b"key").unwrap(), Some(b"two".to_vec()));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_group_validates_every_batch_before_writing() {
+    let path = tmp_path("write-group-invalid");
+    let mut store = Store::open(&path).unwrap();
+    let mut valid = WriteBatch::new();
+    valid.set(b"valid".to_vec(), b"value".to_vec());
+    let mut invalid = WriteBatch::new();
+    invalid.set(vec![b'x'; MAX_KEY_BYTES + 1], b"value".to_vec());
+
+    let error = store.write_group(vec![valid, invalid]).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(store.current_sequence(), 0);
+    assert_eq!(store.get(b"valid").unwrap(), None);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert!(!store.is_poisoned());
 
     std::fs::remove_file(&path).ok();
 }

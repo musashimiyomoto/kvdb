@@ -15,7 +15,7 @@ src/
 ├── store.rs      — WAL, memtable, manifest, recovery, MVCC, compaction
 ├── sstable.rs    — SSTable codec, sparse index, and Bloom filter
 ├── limits.rs     — storage input and allocation limits
-├── http.rs       — Axum router, REST handlers, Basic-auth middleware
+├── http.rs       — Axum router, bounded storage worker, group commit, auth
 ├── log.rs        — dependency-free structured line logging
 └── bin/
     ├── server.rs — HTTP server (axum + tokio)
@@ -33,6 +33,12 @@ or acknowledged. A trailing record left torn by a crash is treated as
 uncommitted and dropped during recovery. `KVDB_DURABILITY=buffered` is an
 explicit performance mode that flushes only to the operating system and can
 lose acknowledged writes after an OS crash or power loss.
+
+HTTP storage operations run on one dedicated blocking worker behind a bounded
+FIFO queue. Adjacent writes are committed as separate logical WAL records and
+sequence numbers but share one flush/fsync; an intervening GET is never
+reordered. A saturated queue fails immediately with `503 Service Unavailable`
+instead of growing without bound.
 
 ## REST API
 
@@ -91,8 +97,9 @@ The performance tooling has three separate jobs:
   regressions in individual storage paths.
 - `benches/kvdb_bench.rs` is the end-to-end benchmark. It measures explicit
   buffered and durable writes, durable batches, randomized memtable and warm
-  SSTable reads, WAL recovery, overlapping compaction, and real TCP GET/PUT at
-  several concurrency levels.
+  SSTable reads with the application cache both enabled and disabled, WAL
+  recovery, overlapping compaction, and real TCP GET/PUT at several concurrency
+  levels.
 
 Current load suite (all passed in `17.73 s` on the machine described below):
 
@@ -173,20 +180,34 @@ The memtable is flushed when the first configured limit is reached:
 | `KVDB_MEMTABLE_VERSIONS_LIMIT` | 16384 | retained memtable versions |
 | `KVDB_WAL_BYTES_LIMIT` | 128 MiB | WAL file size |
 | `KVDB_COMPACTION_THRESHOLD` | 8 | SSTable count; `0` disables automatic compaction |
+| `KVDB_SSTABLE_FILE_CACHE_CAPACITY` | 64 | open SSTable file handles; `0` disables |
+| `KVDB_SSTABLE_BLOCK_CACHE_BYTES` | 64 MiB | decoded block payload budget; `0` disables |
+
+The HTTP storage worker has separate backpressure and group-commit controls:
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `KVDB_STORAGE_QUEUE_CAPACITY` | 1024 | queued storage commands before HTTP returns `503` |
+| `KVDB_GROUP_COMMIT_MAX` | 64 | maximum adjacent writes sharing one WAL flush/fsync |
+| `KVDB_GROUP_COMMIT_DELAY_US` | 1000 | durable-write collection window in microseconds |
 
 After a successful flush, the manifest is updated and the WAL is truncated.
 Each SSTable key record contains its versions in ascending commit-sequence
 order. Tables group records into 64-entry blocks with a persisted **sparse
 index** (one first key and byte range per block) and a **Bloom filter**.
 Opening a table does not load every key into memory; a Bloom negative skips the
-file entirely, while a possible hit binary-searches the index and scans one
-block. Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the
-Store automatically performs a full compaction: it deduplicates identical
-commit sequences, preserves historical values and tombstones for MVCC, and
-atomically replaces the manifest. Setting the threshold to `0` disables
-automation; `Store::compact()` remains available for an explicit run.
-Automatic and ordinary manual compaction preserve every currently retained
-version.
+file entirely, while a possible hit binary-searches the index and searches one
+decoded block. Open files and decoded blocks share bounded LRU caches across
+all live tables in a Store. Compaction invalidates retired table entries before
+deleting their files; hit/miss/eviction/residency counters are available from
+`Store::sstable_cache_metrics()`.
+
+Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the Store
+automatically performs a full compaction: it deduplicates identical commit
+sequences, preserves historical values and tombstones for MVCC, and atomically
+replaces the manifest. Setting the threshold to `0` disables automation;
+`Store::compact()` remains available for an explicit run. Automatic and
+ordinary manual compaction preserve every currently retained version.
 
 ### Atomic batches
 
@@ -302,7 +323,7 @@ and a local performance baseline are implemented.
 
 The first persistence-hardening pass is complete: durable mode calls
 `sync_data`, recovery allocations are bounded, storage read failures propagate,
-memory/WAL flush limits are enforced, and a second writer is rejected. The next
-work is checksummed file formats and crash-injection tests, followed by moving
-blocking storage I/O off async request workers. See the
+memory/WAL flush limits are enforced, and a second writer is rejected. The
+benchmark-driven performance pass is active: bounded worker/group commit is in
+place, with SSTable caching and background streaming compaction next. See the
 [prioritized roadmap](ROADMAP.md) for current status and acceptance criteria.
