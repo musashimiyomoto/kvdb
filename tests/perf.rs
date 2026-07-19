@@ -71,21 +71,28 @@ fn storage_bytes(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// Write throughput: durable `set` (each does a WAL append + flush-to-OS).
+fn keep_all_writes_in_memtable(store: &mut Store) {
+    store.set_memtable_limit(usize::MAX);
+    store.set_memtable_bytes_limit(usize::MAX);
+    store.set_memtable_versions_limit(usize::MAX);
+    store.set_wal_bytes_limit(u64::MAX);
+}
+
+/// Write throughput in the durability mode selected by `KVDB_DURABILITY`.
 #[test]
 #[ignore = "informational benchmark; run with --release --ignored --nocapture"]
 fn perf_set_throughput() {
     let dir = tmp_dir("set");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX); // isolate the write path from flushing
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 200_000;
     let start = Instant::now();
     for i in 0..N {
         s.set(key(i), value(i)).unwrap();
     }
-    report("set (durable, no flush)", N, start.elapsed());
+    report("set (WAL record, no flush)", N, start.elapsed());
     report_storage("WAL after individual SET", storage_bytes(&dir), N);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -98,7 +105,7 @@ fn perf_batch_set_throughput() {
     let dir = tmp_dir("batch-set");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 200_000;
     const BATCH_SIZE: usize = 100;
@@ -123,7 +130,7 @@ fn perf_delete_throughput() {
     let dir = tmp_dir("delete");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 50_000;
     let mut batch = WriteBatch::new();
@@ -148,7 +155,7 @@ fn perf_get_memtable_hit() {
     let dir = tmp_dir("get-mem");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 100_000;
     for i in 0..N {
@@ -157,7 +164,7 @@ fn perf_get_memtable_hit() {
 
     let start = Instant::now();
     for i in 0..N {
-        black_box(s.get(&key(i)));
+        black_box(s.get(&key(i)).unwrap());
     }
     report("get hit (memtable)", N, start.elapsed());
 
@@ -172,7 +179,7 @@ fn perf_get_sstable_hit() {
     let dir = tmp_dir("get-sst");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 100_000;
     for i in 0..N {
@@ -182,7 +189,7 @@ fn perf_get_sstable_hit() {
 
     let start = Instant::now();
     for i in 0..N {
-        black_box(s.get(&key(i)));
+        black_box(s.get(&key(i)).unwrap());
     }
     report("get hit (sstable)", N, start.elapsed());
 
@@ -197,7 +204,7 @@ fn perf_get_historical_sstable() {
     let dir = tmp_dir("get-historical");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
     s.set_compaction_threshold(0);
 
     const KEYS: usize = 20_000;
@@ -240,7 +247,7 @@ fn perf_get_miss() {
 
     let start = Instant::now();
     for i in 0..N {
-        black_box(s.get(format!("missing-{i}").as_bytes()));
+        black_box(s.get(format!("missing-{i}").as_bytes()).unwrap());
     }
     report("get miss (10 Bloom checks)", N, start.elapsed());
 
@@ -254,7 +261,7 @@ fn perf_flush_cost() {
     let dir = tmp_dir("flush");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 200_000;
     for i in 0..N {
@@ -279,7 +286,7 @@ fn perf_recovery_from_wal() {
     const N: usize = 200_000;
     {
         let mut s = Store::open(&wal).unwrap();
-        s.set_memtable_limit(usize::MAX); // keep it all in the WAL (no flush)
+        keep_all_writes_in_memtable(&mut s);
         for i in 0..N {
             s.set(key(i), value(i)).unwrap();
         }
@@ -288,7 +295,7 @@ fn perf_recovery_from_wal() {
     let start = Instant::now();
     let s = Store::open(&wal).unwrap();
     let elapsed = start.elapsed();
-    assert_eq!(s.len(), N);
+    assert_eq!(s.len().unwrap(), N);
     report("recovery (replay wal)", N, elapsed);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -304,12 +311,14 @@ fn perf_recovery_from_sstable() {
     const N: usize = 200_000;
     {
         let mut s = Store::open(&wal).unwrap();
-        s.set_memtable_limit(usize::MAX);
-        let mut batch = WriteBatch::new();
-        for i in 0..N {
-            batch.set(key(i), value(i));
+        keep_all_writes_in_memtable(&mut s);
+        for chunk_start in (0..N).step_by(100_000) {
+            let mut batch = WriteBatch::new();
+            for i in chunk_start..(chunk_start + 100_000).min(N) {
+                batch.set(key(i), value(i));
+            }
+            s.write_batch(batch).unwrap();
         }
-        s.write_batch(batch).unwrap();
         s.flush().unwrap();
     }
 
@@ -330,7 +339,7 @@ fn perf_full_compaction() {
     let dir = tmp_dir("compaction");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
     s.set_compaction_threshold(0);
 
     const N: usize = 100_000;
@@ -363,7 +372,7 @@ fn perf_mvcc_retention_compaction() {
     let dir = tmp_dir("retention");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
     s.set_compaction_threshold(0);
 
     const KEYS: usize = 20_000;
@@ -397,7 +406,7 @@ fn perf_snapshot_materialization() {
     let dir = tmp_dir("snapshot");
     let wal = dir.join("kvdb.wal");
     let mut s = Store::open(&wal).unwrap();
-    s.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut s);
 
     const N: usize = 100_000;
     let mut batch = WriteBatch::new();
@@ -425,7 +434,7 @@ async fn perf_http_router_get() {
     let dir = tmp_dir("http-get");
     let wal = dir.join("kvdb.wal");
     let mut store = Store::open(&wal).unwrap();
-    store.set_memtable_limit(usize::MAX);
+    keep_all_writes_in_memtable(&mut store);
 
     const KEYS: usize = 10_000;
     const REQUESTS: usize = 50_000;

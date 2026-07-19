@@ -59,13 +59,17 @@ fn bulk_insert_survives_many_flushes_and_reopen() {
     let s = Store::open(&wal).unwrap();
     for i in 0..N {
         if i % 4 == 0 {
-            assert_eq!(s.get(&key(i)), None, "key {i} should be deleted");
+            assert_eq!(s.get(&key(i)).unwrap(), None, "key {i} should be deleted");
         } else {
-            assert_eq!(s.get(&key(i)), Some(value(i)), "key {i} should survive");
+            assert_eq!(
+                s.get(&key(i)).unwrap(),
+                Some(value(i)),
+                "key {i} should survive"
+            );
         }
     }
     let expected_live = N - N.div_ceil(4);
-    assert_eq!(s.len(), expected_live);
+    assert_eq!(s.len().unwrap(), expected_live);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -160,7 +164,7 @@ fn mixed_workload_matches_reference_across_reopens() {
                 assert_eq!(store.delete(&operation_key).unwrap(), existed);
             }
             _ => assert_eq!(
-                store.get(&operation_key),
+                store.get(&operation_key).unwrap(),
                 expected.get(&operation_key).cloned()
             ),
         }
@@ -177,17 +181,21 @@ fn mixed_workload_matches_reference_across_reopens() {
 
             for _ in 0..256 {
                 let probe = key(rng.next_usize(KEYSPACE));
-                assert_eq!(store.get(&probe), expected.get(&probe).cloned());
+                assert_eq!(store.get(&probe).unwrap(), expected.get(&probe).cloned());
             }
         }
     }
 
     drop(store);
     let store = Store::open(&wal).unwrap();
-    assert_eq!(store.len(), expected.len());
+    assert_eq!(store.len().unwrap(), expected.len());
     for i in 0..KEYSPACE {
         let key = key(i);
-        assert_eq!(store.get(&key), expected.get(&key).cloned(), "key {i}");
+        assert_eq!(
+            store.get(&key).unwrap(),
+            expected.get(&key).cloned(),
+            "key {i}"
+        );
     }
 
     std::fs::remove_dir_all(&dir).ok();

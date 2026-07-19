@@ -36,6 +36,11 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::limits::{
+    MAX_BLOOM_FILTER_BYTES, MAX_BLOOM_HASHES, MAX_KEY_BYTES, MAX_SSTABLE_RECORD_BYTES,
+    MAX_VALUE_BYTES, MAX_VERSIONS_PER_KEY,
+};
+
 /// Record flags on disk.
 const FLAG_SET: u8 = 0;
 const FLAG_TOMBSTONE: u8 = 1;
@@ -193,6 +198,7 @@ impl SsTable {
         w.flush()?;
         w.get_ref().sync_all()?;
         std::fs::rename(&tmp, path)?;
+        sync_parent_directory(path)?;
         Ok(())
     }
 
@@ -222,6 +228,16 @@ impl SsTable {
 
     /// Looks up the newest version whose sequence is at most `sequence`.
     pub fn get_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
+        Ok(self.version_at(key, sequence)?.map(|version| version.value))
+    }
+
+    pub(crate) fn latest_sequence(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        Ok(self
+            .version_at(key, u64::MAX)?
+            .map(|version| version.sequence))
+    }
+
+    fn version_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<VersionedValue>> {
         if !self.bloom.may_contain(key) {
             return Ok(None);
         }
@@ -247,10 +263,9 @@ impl SsTable {
                 Ordering::Less => previous_key = Some(record_key),
                 Ordering::Equal => {
                     return Ok(versions
-                        .iter()
+                        .into_iter()
                         .rev()
-                        .find(|version| version.sequence <= sequence)
-                        .map(|version| version.value.clone()));
+                        .find(|version| version.sequence <= sequence));
                 }
                 Ordering::Greater => return Ok(None),
             }
@@ -386,7 +401,12 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
         .map_err(|_| invalid_data("SSTable record count is too large"))?;
     let hashes = read_u8(&mut reader)?;
     let bloom_len = u64::from(read_u32(&mut reader)?);
-    if hashes == 0 || bloom_len == 0 || bloom_len > reader.limit() {
+    if hashes == 0
+        || hashes > MAX_BLOOM_HASHES
+        || bloom_len == 0
+        || bloom_len > MAX_BLOOM_FILTER_BYTES as u64
+        || bloom_len > reader.limit()
+    {
         return Err(invalid_data("SSTable Bloom filter has invalid bounds"));
     }
     let mut bits = vec![0; bloom_len as usize];
@@ -483,9 +503,20 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path.parent().filter(|path| !path.as_os_str().is_empty());
+    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Encodes one key and all of its versions (see the module-level format docs).
 fn write_record<W: Write>(w: &mut W, key: &[u8], versions: &[VersionedValue]) -> io::Result<()> {
-    validate_versions(versions, io::ErrorKind::InvalidInput)?;
+    validate_record(key, versions, io::ErrorKind::InvalidInput)?;
     write_chunk(w, key)?;
     let count = u32::try_from(versions.len())
         .map_err(|_| invalid_input("SSTable key has too many versions"))?;
@@ -504,7 +535,7 @@ fn write_record<W: Write>(w: &mut W, key: &[u8], versions: &[VersionedValue]) ->
 }
 
 fn encoded_record_len(key: &[u8], versions: &[VersionedValue]) -> io::Result<u64> {
-    validate_versions(versions, io::ErrorKind::InvalidInput)?;
+    validate_record(key, versions, io::ErrorKind::InvalidInput)?;
     let mut len = 4u64
         .checked_add(key.len() as u64)
         .and_then(|len| len.checked_add(4))
@@ -517,6 +548,9 @@ fn encoded_record_len(key: &[u8], versions: &[VersionedValue]) -> io::Result<u64
         len = len
             .checked_add(version_len)
             .ok_or_else(|| invalid_input("SSTable record is too large"))?;
+    }
+    if len > MAX_SSTABLE_RECORD_BYTES as u64 {
+        return Err(invalid_input("SSTable record exceeds size limit"));
     }
     Ok(len)
 }
@@ -536,18 +570,23 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(Vec<u8>, Vec<VersionedV
         Err(e) => return Err(e),
     }
     r.read_exact(&mut key_len[1..])?;
-    let mut key = vec![0u8; u32::from_be_bytes(key_len) as usize];
+    let key_len = u32::from_be_bytes(key_len) as usize;
+    if key_len > MAX_KEY_BYTES {
+        return Err(invalid_data("SSTable key exceeds size limit"));
+    }
+    let mut key = vec![0u8; key_len];
     r.read_exact(&mut key)?;
 
     let count = read_u32(r)? as usize;
-    if count == 0 {
-        return Err(invalid_data("SSTable key has no versions"));
+    if count == 0 || count > MAX_VERSIONS_PER_KEY {
+        return Err(invalid_data("SSTable version count exceeds limit"));
     }
-    let mut versions = Vec::new();
+    let mut versions = Vec::with_capacity(count.min(1024));
+    let mut record_bytes = 4usize + key.len() + 4;
     for _ in 0..count {
         let sequence = read_u64(r)?;
         let value = match read_u8(r)? {
-            FLAG_SET => Value::Set(read_chunk(r)?),
+            FLAG_SET => Value::Set(read_chunk(r, MAX_VALUE_BYTES, "SSTable value")?),
             FLAG_TOMBSTONE => Value::Tombstone,
             other => {
                 return Err(invalid_data(format!(
@@ -555,6 +594,12 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(Vec<u8>, Vec<VersionedV
                 )));
             }
         };
+        record_bytes = record_bytes
+            .checked_add(8 + 1 + value_bytes(&value))
+            .ok_or_else(|| invalid_data("SSTable record size overflow"))?;
+        if record_bytes > MAX_SSTABLE_RECORD_BYTES {
+            return Err(invalid_data("SSTable record exceeds size limit"));
+        }
         versions.push(VersionedValue { sequence, value });
     }
     validate_versions(&versions, io::ErrorKind::InvalidData)?;
@@ -562,8 +607,8 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<(Vec<u8>, Vec<VersionedV
 }
 
 fn validate_versions(versions: &[VersionedValue], kind: io::ErrorKind) -> io::Result<()> {
-    if versions.is_empty() {
-        return Err(io::Error::new(kind, "SSTable key has no versions"));
+    if versions.is_empty() || versions.len() > MAX_VERSIONS_PER_KEY {
+        return Err(io::Error::new(kind, "SSTable version count exceeds limit"));
     }
     let mut previous = 0;
     for version in versions {
@@ -578,9 +623,38 @@ fn validate_versions(versions: &[VersionedValue], kind: io::ErrorKind) -> io::Re
     Ok(())
 }
 
+fn validate_record(key: &[u8], versions: &[VersionedValue], kind: io::ErrorKind) -> io::Result<()> {
+    if key.len() > MAX_KEY_BYTES {
+        return Err(io::Error::new(kind, "SSTable key exceeds size limit"));
+    }
+    validate_versions(versions, kind)?;
+    let mut encoded_bytes = 4usize + key.len() + 4;
+    for version in versions {
+        if let Value::Set(value) = &version.value
+            && value.len() > MAX_VALUE_BYTES
+        {
+            return Err(io::Error::new(kind, "SSTable value exceeds size limit"));
+        }
+        encoded_bytes = encoded_bytes
+            .checked_add(8 + 1 + value_bytes(&version.value))
+            .ok_or_else(|| io::Error::new(kind, "SSTable record size overflow"))?;
+        if encoded_bytes > MAX_SSTABLE_RECORD_BYTES {
+            return Err(io::Error::new(kind, "SSTable record exceeds size limit"));
+        }
+    }
+    Ok(())
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Set(value) => 4 + value.len(),
+        Value::Tombstone => 0,
+    }
+}
+
 fn read_index_key<R: Read>(r: &mut std::io::Take<R>) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as u64;
-    if len > r.limit() {
+    if len > MAX_KEY_BYTES as u64 || len > r.limit() {
         return Err(invalid_data("SSTable index key exceeds index bounds"));
     }
     let mut key = vec![0u8; len as usize];
@@ -588,8 +662,11 @@ fn read_index_key<R: Read>(r: &mut std::io::Take<R>) -> io::Result<Vec<u8>> {
     Ok(key)
 }
 
-fn read_chunk<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_chunk<R: Read>(r: &mut R, max: usize, field: &str) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
+    if len > max {
+        return Err(invalid_data(format!("{field} exceeds size limit")));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)

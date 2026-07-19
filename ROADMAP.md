@@ -22,6 +22,31 @@ The Dockerfile's Rust 1.96 build could not be reproduced during this review
 because Docker Hub was unavailable. CI and local builds use the lockfile, while
 the current Docker build does not.
 
+## Implementation progress
+
+First P0 hardening increment (2026-07-19):
+
+- **Implemented R1:** default mutations now flush and call `sync_data`; buffered
+  durability is explicit and documented.
+- **Implemented R3:** current reads and key counts propagate storage errors;
+  HTTP no longer turns SSTable failures into `404` responses.
+- **Implemented R4:** memtable key, byte, version, and WAL byte limits trigger
+  flush independently; transaction conflict detection no longer keeps an
+  unbounded per-key map.
+- **Implemented R5:** public writes plus WAL/SSTable decoders enforce hard key,
+  value, batch, version, record, and Bloom metadata bounds before allocation.
+- **Implemented R6:** an advisory lifetime lock rejects a second writable Store
+  for the same WAL.
+- **Partially implemented R2/R7:** uncertain storage writes poison the Store,
+  and SSTable/manifest renames fsync their parent directory. Versioned frames,
+  checksums, failpoint crash tests, and format migration remain open.
+- **Implemented the reproducibility portion of R12:** the repository, CI, and
+  Docker now target Rust 1.96.0, and Docker consumes `Cargo.lock` with
+  `--locked`. Supply-chain scanning and action SHA pinning remain open.
+
+The risk table below is the original audit snapshot; this progress section is
+the current source of status until each risk is fully closed.
+
 ## Current risk register
 
 The order below reflects correctness and operational impact, not implementation
@@ -205,4 +230,3 @@ online backup, and optional TTL with explicitly defined MVCC semantics.
 Replication, clustering, distributed transactions, and automatic sharding are
 deliberately out of scope until single-node durability, bounded recovery,
 backpressure, and operational recovery are demonstrated.
-

@@ -181,6 +181,38 @@ async fn large_body_roundtrips_over_http() {
     std::fs::remove_file(&path).ok();
 }
 
+#[tokio::test]
+async fn storage_read_error_is_not_reported_as_not_found() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = tmp_path("storage-error");
+    let mut store = Store::open(&path).unwrap();
+    store.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+    store.flush().unwrap();
+    let state = AppState::new(store, USER, PASS);
+
+    let stem = path.file_stem().unwrap().to_string_lossy();
+    let sstable = path.with_file_name(format!("{stem}-000000.sst"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sstable)
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    file.write_all(&u32::MAX.to_be_bytes()).unwrap();
+    drop(file);
+
+    let auth = basic(USER, PASS);
+    let (status, body) = send(&state, "GET", "/v1/keys/key", Some(&auth), "").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "storage unavailable\n");
+
+    drop(state);
+    std::fs::remove_file(path.with_extension("manifest")).ok();
+    std::fs::remove_file(sstable).ok();
+    std::fs::remove_file(path.with_extension("wal.lock")).ok();
+    std::fs::remove_file(&path).ok();
+}
+
 /// Minimal standard base64 encoder (no padding shortcuts), for test auth headers.
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

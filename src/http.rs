@@ -27,7 +27,10 @@ use axum::{Router, extract::Request};
 use axum_extra::TypedHeader;
 use axum_extra::headers::{Authorization, authorization::Basic};
 
+use crate::log_error;
 use crate::store::Store;
+
+const TARGET: &str = "kvdb::http";
 
 /// Shared state handed to every request handler.
 #[derive(Clone)]
@@ -80,8 +83,12 @@ async fn get_key(State(state): State<AppState>, Path(key): Path<String>) -> Resp
         store.get(key.as_bytes())
     };
     match value {
-        Some(v) => (StatusCode::OK, v).into_response(),
-        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+        Ok(Some(v)) => (StatusCode::OK, v).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+        Err(error) => {
+            log_error!(TARGET, "get failed: {error}");
+            storage_error()
+        }
     }
 }
 
@@ -93,11 +100,10 @@ async fn put_key(State(state): State<AppState>, Path(key): Path<String>, body: B
     };
     match store.set(key.into_bytes(), body.to_vec()) {
         Ok(()) => (StatusCode::OK, "OK\n").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set failed: {e}\n"),
-        )
-            .into_response(),
+        Err(error) => {
+            log_error!(TARGET, "set failed: {error}");
+            storage_error()
+        }
     }
 }
 
@@ -110,11 +116,10 @@ async fn delete_key(State(state): State<AppState>, Path(key): Path<String>) -> R
     match store.delete(key.as_bytes()) {
         Ok(true) => (StatusCode::OK, "OK\n").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "not found\n").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("delete failed: {e}\n"),
-        )
-            .into_response(),
+        Err(error) => {
+            log_error!(TARGET, "delete failed: {error}");
+            storage_error()
+        }
     }
 }
 
@@ -156,6 +161,10 @@ fn unauthorized() -> Response {
 /// `500` used when the shared store mutex is poisoned by a prior panic.
 fn lock_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned\n").into_response()
+}
+
+fn storage_error() -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, "storage unavailable\n").into_response()
 }
 
 /// Compares two byte slices without short-circuiting on the first difference.

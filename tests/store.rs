@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use kvdb::store::{Store, TransactionError, WriteBatch};
+use kvdb::limits::MAX_KEY_BYTES;
+use kvdb::store::{Durability, Store, TransactionError, WriteBatch};
 
 /// Returns a fresh, unique temp WAL path and removes any leftover from a
 /// previous run with the same tag.
@@ -29,9 +30,9 @@ fn set_get_delete() {
     let path = tmp_path("basic");
     let mut s = Store::open(&path).unwrap();
     s.set(b"a".to_vec(), b"1".to_vec()).unwrap();
-    assert_eq!(s.get(b"a"), Some(b"1".to_vec()));
+    assert_eq!(s.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert!(s.delete(b"a").unwrap());
-    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"a").unwrap(), None);
     std::fs::remove_file(&path).unwrap();
 }
 
@@ -45,9 +46,9 @@ fn recovers_after_reopen() {
         s.delete(b"x").unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.get(b"x"), None);
-    assert_eq!(s.get(b"y"), Some(b"world".to_vec()));
-    assert_eq!(s.len(), 1);
+    assert_eq!(s.get(b"x").unwrap(), None);
+    assert_eq!(s.get(b"y").unwrap(), Some(b"world".to_vec()));
+    assert_eq!(s.len().unwrap(), 1);
     std::fs::remove_file(&path).unwrap();
 }
 
@@ -71,9 +72,9 @@ fn flush_creates_sstable_and_truncates_wal() {
     assert!(s.manifest_path().exists());
 
     // Values are served from the SSTable now that the memtable is empty.
-    assert_eq!(s.get(b"a"), Some(b"1".to_vec()));
-    assert_eq!(s.get(b"b"), Some(b"2".to_vec()));
-    assert_eq!(s.get(b"c"), Some(b"3".to_vec()));
+    assert_eq!(s.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(s.get(b"b").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(s.get(b"c").unwrap(), Some(b"3".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -96,12 +97,13 @@ fn tombstone_in_sstable_does_not_resurrect() {
     assert_eq!(s.sstable_count(), 2);
 
     // The newer tombstone must shadow the older value, not resurrect it.
-    assert_eq!(s.get(b"k"), None);
+    assert_eq!(s.get(b"k").unwrap(), None);
 
     // And it must survive a reopen (tombstone persisted on disk).
+    drop(s);
     let s2 = Store::open(&wal).unwrap();
-    assert_eq!(s2.get(b"k"), None);
-    assert_eq!(s2.len(), 0);
+    assert_eq!(s2.get(b"k").unwrap(), None);
+    assert_eq!(s2.len().unwrap(), 0);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -118,11 +120,12 @@ fn newer_value_shadows_older_sstable() {
     s.flush().unwrap();
 
     assert_eq!(s.sstable_count(), 2);
-    assert_eq!(s.get(b"k"), Some(b"new".to_vec()));
-    assert_eq!(s.len(), 1, "duplicate key counts once");
+    assert_eq!(s.get(b"k").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.len().unwrap(), 1, "duplicate key counts once");
 
+    drop(s);
     let s2 = Store::open(&wal).unwrap();
-    assert_eq!(s2.get(b"k"), Some(b"new".to_vec()));
+    assert_eq!(s2.get(b"k").unwrap(), Some(b"new".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -143,9 +146,9 @@ fn recovers_flushed_data_and_unflushed_wal_tail() {
 
     // Reopen: SSTable data + replayed WAL tail must both be present.
     let s = Store::open(&wal).unwrap();
-    assert_eq!(s.get(b"flushed"), Some(b"on-disk".to_vec()));
-    assert_eq!(s.get(b"pending"), Some(b"in-wal".to_vec()));
-    assert_eq!(s.len(), 2);
+    assert_eq!(s.get(b"flushed").unwrap(), Some(b"on-disk".to_vec()));
+    assert_eq!(s.get(b"pending").unwrap(), Some(b"in-wal".to_vec()));
+    assert_eq!(s.len().unwrap(), 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -166,8 +169,8 @@ fn orphan_sstable_absent_from_manifest_is_ignored() {
     std::fs::write(dir.join("kvdb-000009.sst"), b"garbage not in manifest").unwrap();
 
     let s = Store::open(&wal).unwrap();
-    assert_eq!(s.get(b"real"), Some(b"yes".to_vec()));
-    assert_eq!(s.len(), 1);
+    assert_eq!(s.get(b"real").unwrap(), Some(b"yes".to_vec()));
+    assert_eq!(s.len().unwrap(), 1);
     assert_eq!(s.sstable_count(), 1, "orphan table must not be loaded");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -182,9 +185,9 @@ fn empty_value_is_distinct_from_absent() {
 
     // An empty value is a real, present value — not the same as "missing".
     s.set(b"k".to_vec(), Vec::new()).unwrap();
-    assert_eq!(s.get(b"k"), Some(Vec::new()));
-    assert_eq!(s.get(b"absent"), None);
-    assert_eq!(s.len(), 1);
+    assert_eq!(s.get(b"k").unwrap(), Some(Vec::new()));
+    assert_eq!(s.get(b"absent").unwrap(), None);
+    assert_eq!(s.len().unwrap(), 1);
 
     std::fs::remove_file(&path).ok();
 }
@@ -202,11 +205,12 @@ fn binary_keys_and_values_roundtrip_through_flush() {
     let mut s = Store::open(&wal).unwrap();
     s.set(key.clone(), val.clone()).unwrap();
     s.flush().unwrap();
-    assert_eq!(s.get(&key), Some(val.clone()));
+    assert_eq!(s.get(&key).unwrap(), Some(val.clone()));
 
     // Survives reopen (re-read from the SSTable).
+    drop(s);
     let s2 = Store::open(&wal).unwrap();
-    assert_eq!(s2.get(&key), Some(val));
+    assert_eq!(s2.get(&key).unwrap(), Some(val));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -220,8 +224,8 @@ fn overwrite_updates_value_and_keeps_count() {
     s.set(b"k".to_vec(), b"v2".to_vec()).unwrap();
     s.set(b"k".to_vec(), b"v3".to_vec()).unwrap();
 
-    assert_eq!(s.get(b"k"), Some(b"v3".to_vec()));
-    assert_eq!(s.len(), 1, "overwrites don't add keys");
+    assert_eq!(s.get(b"k").unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(s.len().unwrap(), 1, "overwrites don't add keys");
 
     std::fs::remove_file(&path).ok();
 }
@@ -254,8 +258,8 @@ fn delete_of_key_living_only_in_sstable_reports_true() {
 
     // delete must see the live value on disk and report true.
     assert!(s.delete(b"k").unwrap(), "delete of an on-disk key => true");
-    assert_eq!(s.get(b"k"), None);
-    assert_eq!(s.len(), 0);
+    assert_eq!(s.get(b"k").unwrap(), None);
+    assert_eq!(s.len().unwrap(), 0);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -269,10 +273,11 @@ fn large_value_roundtrips() {
     let mut s = Store::open(&wal).unwrap();
     s.set(b"blob".to_vec(), big.clone()).unwrap();
     s.flush().unwrap();
-    assert_eq!(s.get(b"blob"), Some(big.clone()));
+    assert_eq!(s.get(b"blob").unwrap(), Some(big.clone()));
 
+    drop(s);
     let s2 = Store::open(&wal).unwrap();
-    assert_eq!(s2.get(b"blob"), Some(big));
+    assert_eq!(s2.get(b"blob").unwrap(), Some(big));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -305,16 +310,20 @@ fn many_keys_across_many_flushes_all_recover() {
     for i in 0..N {
         let key = format!("key-{i:04}");
         if i % 10 == 0 {
-            assert_eq!(s.get(key.as_bytes()), None, "{key} should be deleted");
+            assert_eq!(
+                s.get(key.as_bytes()).unwrap(),
+                None,
+                "{key} should be deleted"
+            );
         } else {
             assert_eq!(
-                s.get(key.as_bytes()),
+                s.get(key.as_bytes()).unwrap(),
                 Some(format!("val-{i}").into_bytes()),
                 "{key} should survive"
             );
         }
     }
-    assert_eq!(s.len(), N - N.div_ceil(10));
+    assert_eq!(s.len().unwrap(), N - N.div_ceil(10));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -341,12 +350,12 @@ fn sparse_index_reads_large_sstable_after_reopen() {
     let s = Store::open(&wal).unwrap();
     for i in [0, 63, 64, 127, 128, N - 1] {
         assert_eq!(
-            s.get(format!("key-{i:04}").as_bytes()),
+            s.get(format!("key-{i:04}").as_bytes()).unwrap(),
             Some(format!("value-{i}").into_bytes())
         );
     }
-    assert_eq!(s.get(b"key-0063x"), None);
-    assert_eq!(s.len(), N);
+    assert_eq!(s.get(b"key-0063x").unwrap(), None);
+    assert_eq!(s.len().unwrap(), N);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -370,11 +379,11 @@ fn compaction_keeps_current_values_and_historical_versions() {
 
     s.compact().unwrap();
     assert_eq!(s.sstable_count(), 1);
-    assert_eq!(s.get(b"updated"), Some(b"new".to_vec()));
-    assert_eq!(s.get(b"deleted"), None);
-    assert_eq!(s.get(b"stable"), Some(b"kept".to_vec()));
-    assert_eq!(s.get(b"added"), Some(b"fresh".to_vec()));
-    assert_eq!(s.len(), 3);
+    assert_eq!(s.get(b"updated").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"deleted").unwrap(), None);
+    assert_eq!(s.get(b"stable").unwrap(), Some(b"kept".to_vec()));
+    assert_eq!(s.get(b"added").unwrap(), Some(b"fresh".to_vec()));
+    assert_eq!(s.len().unwrap(), 3);
     assert_eq!(s.get_at(b"updated", 1).unwrap(), Some(b"old".to_vec()));
     assert_eq!(s.get_at(b"updated", 4).unwrap(), Some(b"new".to_vec()));
     assert_eq!(s.get_at(b"deleted", 2).unwrap(), Some(b"present".to_vec()));
@@ -388,10 +397,10 @@ fn compaction_keeps_current_values_and_historical_versions() {
     drop(s);
 
     let s = Store::open(&wal).unwrap();
-    assert_eq!(s.get(b"updated"), Some(b"new".to_vec()));
-    assert_eq!(s.get(b"deleted"), None);
-    assert_eq!(s.get(b"later"), Some(b"tail".to_vec()));
-    assert_eq!(s.len(), 4);
+    assert_eq!(s.get(b"updated").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"deleted").unwrap(), None);
+    assert_eq!(s.get(b"later").unwrap(), Some(b"tail".to_vec()));
+    assert_eq!(s.len().unwrap(), 4);
     assert_eq!(s.get_at(b"updated", 1).unwrap(), Some(b"old".to_vec()));
     assert_eq!(s.get_at(b"deleted", 2).unwrap(), Some(b"present".to_vec()));
 
@@ -411,13 +420,13 @@ fn compaction_retains_history_behind_a_current_tombstone() {
 
     s.compact().unwrap();
     assert_eq!(s.sstable_count(), 1);
-    assert_eq!(s.get(b"gone"), None);
+    assert_eq!(s.get(b"gone").unwrap(), None);
     assert_eq!(s.get_at(b"gone", 1).unwrap(), Some(b"value".to_vec()));
     drop(s);
 
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.sstable_count(), 1);
-    assert_eq!(s.get(b"gone"), None);
+    assert_eq!(s.get(b"gone").unwrap(), None);
     assert_eq!(s.get_at(b"gone", 1).unwrap(), Some(b"value".to_vec()));
     let historical = s.snapshot_at(1).unwrap();
     assert_eq!(historical.sequence(), 1);
@@ -447,7 +456,7 @@ fn compaction_retention_keeps_boundary_state_and_survives_reopen() {
         assert_eq!(s.get_at(b"changed", 4).unwrap(), Some(b"new".to_vec()));
         assert_eq!(s.get_at(b"unchanged", 3).unwrap(), Some(b"first".to_vec()));
         assert_eq!(s.get_at(b"deleted", 3).unwrap(), None);
-        assert_eq!(s.get(b"deleted"), None);
+        assert_eq!(s.get(b"deleted").unwrap(), None);
         assert_eq!(
             s.get_at(b"changed", 2).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
@@ -489,7 +498,7 @@ fn retention_boundary_persists_when_compaction_removes_every_key() {
     assert_eq!(s.current_sequence(), 2);
     assert_eq!(s.history_start_sequence(), 2);
     assert!(s.snapshot_at(1).is_err());
-    assert!(s.is_empty());
+    assert!(s.is_empty().unwrap());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -514,14 +523,14 @@ fn later_flush_and_automatic_compaction_preserve_retention_boundary() {
         assert_eq!(s.sstable_count(), 1);
         assert_eq!(s.history_start_sequence(), 2);
         assert_eq!(s.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(s.get(b"key"), Some(b"v3".to_vec()));
+        assert_eq!(s.get(b"key").unwrap(), Some(b"v3".to_vec()));
         assert!(s.get_at(b"key", 1).is_err());
     }
 
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.history_start_sequence(), 2);
     assert_eq!(s.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
-    assert_eq!(s.get(b"key"), Some(b"v3".to_vec()));
+    assert_eq!(s.get(b"key").unwrap(), Some(b"v3".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -545,19 +554,19 @@ fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     assert_eq!(s.sstable_count(), 2);
     s.set(b"d".to_vec(), b"four".to_vec()).unwrap();
     assert_eq!(s.sstable_count(), 1, "threshold triggers again");
-    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"a").unwrap(), None);
     assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
-    assert_eq!(s.get(b"b"), Some(b"two".to_vec()));
-    assert_eq!(s.get(b"c"), Some(b"three".to_vec()));
-    assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
+    assert_eq!(s.get(b"b").unwrap(), Some(b"two".to_vec()));
+    assert_eq!(s.get(b"c").unwrap(), Some(b"three".to_vec()));
+    assert_eq!(s.get(b"d").unwrap(), Some(b"four".to_vec()));
     drop(s);
 
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.sstable_count(), 1);
     assert_eq!(s.current_sequence(), 5);
-    assert_eq!(s.get(b"a"), None);
+    assert_eq!(s.get(b"a").unwrap(), None);
     assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
-    assert_eq!(s.get(b"d"), Some(b"four".to_vec()));
+    assert_eq!(s.get(b"d").unwrap(), Some(b"four".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -592,17 +601,18 @@ fn atomic_batch_applies_in_order_with_one_sequence_number() {
 
     assert_eq!(s.write_batch(batch).unwrap(), 1);
     assert_eq!(s.current_sequence(), 1);
-    assert_eq!(s.get(b"a"), Some(b"last".to_vec()));
-    assert_eq!(s.get(b"b"), Some(b"second".to_vec()));
+    assert_eq!(s.get(b"a").unwrap(), Some(b"last".to_vec()));
+    assert_eq!(s.get(b"b").unwrap(), Some(b"second".to_vec()));
 
     // An empty batch is a no-op and does not consume a sequence number.
     assert_eq!(s.write_batch(WriteBatch::new()).unwrap(), 1);
     assert_eq!(s.current_sequence(), 1);
 
+    drop(s);
     let s = Store::open(&path).unwrap();
     assert_eq!(s.current_sequence(), 1);
-    assert_eq!(s.get(b"a"), Some(b"last".to_vec()));
-    assert_eq!(s.get(b"b"), Some(b"second".to_vec()));
+    assert_eq!(s.get(b"a").unwrap(), Some(b"last".to_vec()));
+    assert_eq!(s.get(b"b").unwrap(), Some(b"second".to_vec()));
 
     std::fs::remove_file(&path).ok();
 }
@@ -625,8 +635,8 @@ fn torn_batch_is_discarded_without_partial_application() {
 
     let s = Store::open(&path).unwrap();
     assert_eq!(s.current_sequence(), 0);
-    assert_eq!(s.get(b"a"), None);
-    assert_eq!(s.get(b"b"), None);
+    assert_eq!(s.get(b"a").unwrap(), None);
+    assert_eq!(s.get(b"b").unwrap(), None);
 
     std::fs::remove_file(&path).ok();
 }
@@ -652,14 +662,14 @@ fn sequence_survives_flush_and_duplicate_wal_replay() {
     std::fs::write(&wal, wal_before_flush).unwrap();
     let mut s = Store::open(&wal).unwrap();
     assert_eq!(s.current_sequence(), 1);
-    assert_eq!(s.get(b"persisted"), Some(b"value".to_vec()));
+    assert_eq!(s.get(b"persisted").unwrap(), Some(b"value".to_vec()));
     s.set(b"next".to_vec(), b"two".to_vec()).unwrap();
     assert_eq!(s.current_sequence(), 2);
 
     drop(s);
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.current_sequence(), 2);
-    assert_eq!(s.get(b"next"), Some(b"two".to_vec()));
+    assert_eq!(s.get(b"next").unwrap(), Some(b"two".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -680,8 +690,8 @@ fn compaction_does_not_mark_unflushed_wal_as_durable() {
 
     let s = Store::open(&wal).unwrap();
     assert_eq!(s.current_sequence(), 2);
-    assert_eq!(s.get(b"flushed"), Some(b"sstable".to_vec()));
-    assert_eq!(s.get(b"pending"), Some(b"wal".to_vec()));
+    assert_eq!(s.get(b"flushed").unwrap(), Some(b"sstable".to_vec()));
+    assert_eq!(s.get(b"pending").unwrap(), Some(b"wal".to_vec()));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -716,9 +726,9 @@ fn snapshot_remains_stable_after_writes_flush_and_compaction() {
     assert_eq!(snapshot.get(b"kept"), Some(b"visible".as_slice()));
     assert_eq!(snapshot.get(b"added"), None);
 
-    assert_eq!(s.get(b"changing"), Some(b"new".to_vec()));
-    assert_eq!(s.get(b"kept"), None);
-    assert_eq!(s.get(b"added"), Some(b"later".to_vec()));
+    assert_eq!(s.get(b"changing").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(s.get(b"kept").unwrap(), None);
+    assert_eq!(s.get(b"added").unwrap(), Some(b"later".to_vec()));
 
     drop(s);
     let s = Store::open(&wal).unwrap();
@@ -749,18 +759,18 @@ fn optimistic_transaction_reads_its_writes_and_commits_atomically() {
     assert_eq!(transaction.get(b"temporary"), None);
 
     // Uncommitted writes are private to the transaction.
-    assert_eq!(s.get(b"balance"), Some(b"100".to_vec()));
-    assert_eq!(s.get(b"audit"), None);
+    assert_eq!(s.get(b"balance").unwrap(), Some(b"100".to_vec()));
+    assert_eq!(s.get(b"audit").unwrap(), None);
 
     assert_eq!(s.commit_transaction(transaction).unwrap(), 2);
-    assert_eq!(s.get(b"balance"), Some(b"90".to_vec()));
-    assert_eq!(s.get(b"audit"), Some(b"withdraw 10".to_vec()));
+    assert_eq!(s.get(b"balance").unwrap(), Some(b"90".to_vec()));
+    assert_eq!(s.get(b"audit").unwrap(), Some(b"withdraw 10".to_vec()));
     drop(s);
 
     let s = Store::open(&path).unwrap();
     assert_eq!(s.current_sequence(), 2);
-    assert_eq!(s.get(b"balance"), Some(b"90".to_vec()));
-    assert_eq!(s.get(b"audit"), Some(b"withdraw 10".to_vec()));
+    assert_eq!(s.get(b"balance").unwrap(), Some(b"90".to_vec()));
+    assert_eq!(s.get(b"audit").unwrap(), Some(b"withdraw 10".to_vec()));
 
     std::fs::remove_file(&path).ok();
 }
@@ -789,14 +799,14 @@ fn optimistic_transaction_conflict_has_no_partial_writes() {
         }
     ));
     assert_eq!(s.current_sequence(), 2);
-    assert_eq!(s.get(b"key"), Some(b"concurrent".to_vec()));
-    assert_eq!(s.get(b"only-in-transaction"), None);
+    assert_eq!(s.get(b"key").unwrap(), Some(b"concurrent".to_vec()));
+    assert_eq!(s.get(b"only-in-transaction").unwrap(), None);
 
     drop(s);
     let s = Store::open(&path).unwrap();
     assert_eq!(s.current_sequence(), 2);
-    assert_eq!(s.get(b"key"), Some(b"concurrent".to_vec()));
-    assert_eq!(s.get(b"only-in-transaction"), None);
+    assert_eq!(s.get(b"key").unwrap(), Some(b"concurrent".to_vec()));
+    assert_eq!(s.get(b"only-in-transaction").unwrap(), None);
 
     std::fs::remove_file(&path).ok();
 }
@@ -812,8 +822,8 @@ fn independent_transactions_can_both_commit() {
 
     assert_eq!(s.commit_transaction(left).unwrap(), 1);
     assert_eq!(s.commit_transaction(right).unwrap(), 2);
-    assert_eq!(s.get(b"left"), Some(b"one".to_vec()));
-    assert_eq!(s.get(b"right"), Some(b"two".to_vec()));
+    assert_eq!(s.get(b"left").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(s.get(b"right").unwrap(), Some(b"two".to_vec()));
 
     std::fs::remove_file(&path).ok();
 }
@@ -832,7 +842,7 @@ fn transaction_read_conflict_detects_a_key_added_after_snapshot() {
         error,
         TransactionError::Conflict { key, .. } if key == b"missing"
     ));
-    assert_eq!(s.get(b"derived"), None);
+    assert_eq!(s.get(b"derived").unwrap(), None);
 
     std::fs::remove_file(&path).ok();
 }
@@ -858,7 +868,7 @@ fn transaction_conflicts_when_a_read_value_changes_and_changes_back() {
             ..
         }
     ));
-    assert_eq!(s.get(b"derived"), None);
+    assert_eq!(s.get(b"derived").unwrap(), None);
 
     std::fs::remove_file(&path).ok();
 }
@@ -944,8 +954,122 @@ fn torn_wal_tail_is_dropped_but_prior_records_survive() {
 
     // The torn tail is dropped; the earlier committed record remains.
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.get(b"good"), Some(b"kept".to_vec()));
-    assert_eq!(s.len(), 1);
+    assert_eq!(s.get(b"good").unwrap(), Some(b"kept".to_vec()));
+    assert_eq!(s.len().unwrap(), 1);
 
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn second_writer_is_rejected_until_first_store_closes() {
+    let dir = tmp_dir("single-writer");
+    let wal = dir.join("kvdb.wal");
+    let first = Store::open(&wal).unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("a second writer unexpectedly acquired the store"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+    drop(first);
+    Store::open(&wal).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn hot_key_versions_trigger_a_flush() {
+    let dir = tmp_dir("hot-key-limit");
+    let wal = dir.join("kvdb.wal");
+    let mut store = Store::open(&wal).unwrap();
+    store.set_durability(Durability::Buffered);
+    store.set_memtable_limit(usize::MAX);
+    store.set_memtable_bytes_limit(usize::MAX);
+    store.set_memtable_versions_limit(3);
+    store.set_wal_bytes_limit(u64::MAX);
+
+    for value in [b"one".as_slice(), b"two", b"three"] {
+        store.set(b"hot".to_vec(), value.to_vec()).unwrap();
+    }
+
+    assert_eq!(store.sstable_count(), 1);
+    assert_eq!(store.get(b"hot").unwrap(), Some(b"three".to_vec()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn failed_flush_poisons_writes_but_wal_recovers_after_reopen() {
+    let dir = tmp_dir("poisoned-flush");
+    let wal = dir.join("kvdb.wal");
+    let mut store = Store::open(&wal).unwrap();
+    store.set(b"persisted".to_vec(), b"value".to_vec()).unwrap();
+
+    let manifest_tmp = dir.join("kvdb.manifest.tmp");
+    std::fs::create_dir(&manifest_tmp).unwrap();
+    assert!(store.flush().is_err());
+    assert!(store.is_poisoned());
+    let error = store
+        .set(b"rejected".to_vec(), b"value".to_vec())
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+
+    drop(store);
+    std::fs::remove_dir(&manifest_tmp).unwrap();
+    let store = Store::open(&wal).unwrap();
+    assert_eq!(store.get(b"persisted").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(store.get(b"rejected").unwrap(), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn corruption_encountered_after_open_is_returned_by_get() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tmp_dir("late-corruption");
+    let wal = dir.join("kvdb.wal");
+    let mut store = Store::open(&wal).unwrap();
+    store.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+    store.flush().unwrap();
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("kvdb-000000.sst"))
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    file.write_all(&u32::MAX.to_be_bytes()).unwrap();
+    drop(file);
+
+    let error = store.get(b"key").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn oversized_input_is_rejected_without_poisoning_the_store() {
+    let path = tmp_path("oversized-input");
+    let mut store = Store::open(&path).unwrap();
+    let error = store
+        .set(vec![0; MAX_KEY_BYTES + 1], b"value".to_vec())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!store.is_poisoned());
+    store.set(b"valid".to_vec(), b"value".to_vec()).unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn oversized_wal_length_is_rejected_before_allocation() {
+    let path = tmp_path("oversized-wal");
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(&1u64.to_be_bytes());
+    bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+    std::fs::write(&path, bytes).unwrap();
+
+    let error = match Store::open(&path) {
+        Ok(_) => panic!("expected oversized WAL field to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     std::fs::remove_file(&path).ok();
 }

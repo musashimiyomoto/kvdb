@@ -7,12 +7,12 @@ WORKDIR /app
 # Cache dependencies first: copy only the manifest, build a stub, then the
 # real sources. This way `cargo` only re-downloads/re-builds deps when
 # Cargo.toml changes, not on every source edit.
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src/bin \
     && echo "fn main() {}" > src/bin/server.rs \
     && echo "fn main() {}" > src/bin/client.rs \
     && echo "" > src/lib.rs \
-    && cargo build --release --bin kvdb-server \
+    && cargo build --release --locked --bin kvdb-server \
     && rm -rf src
 
 # Now copy the real source and build for real. `touch` bumps the mtimes so
@@ -20,7 +20,7 @@ RUN mkdir -p src/bin \
 # compiled and skip the rebuild.
 COPY src ./src
 RUN touch src/lib.rs src/bin/server.rs src/bin/client.rs \
-    && cargo build --release --bin kvdb-server
+    && cargo build --release --locked --bin kvdb-server
 
 # ---- Runtime stage ----------------------------------------------------------
 # Minimal image: just the binary and a place to keep the WAL.

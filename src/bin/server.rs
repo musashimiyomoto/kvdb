@@ -45,7 +45,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     log_info!(
         TARGET,
         "recovered {} key(s) from {}",
-        store.len(),
+        store.len()?,
         store.wal_path().display()
     );
 

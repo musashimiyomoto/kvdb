@@ -6,6 +6,7 @@
 
 # Local WAL / data files produced at runtime
 *.wal
+*.wal.lock
 /data
 
 # Editor / OS noise

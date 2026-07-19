@@ -7,9 +7,12 @@
 //! The `kvdb-server` and `kvdb-client` binaries build on these modules.
 
 pub mod http;
+pub mod limits;
 pub mod log;
 pub mod sstable;
 pub mod store;
 
 pub use http::{AppState, router};
-pub use store::{BatchOperation, Snapshot, Store, Transaction, TransactionError, WriteBatch};
+pub use store::{
+    BatchOperation, Durability, Snapshot, Store, Transaction, TransactionError, WriteBatch,
+};

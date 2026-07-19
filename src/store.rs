@@ -17,8 +17,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
+use crate::limits::{MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES};
 use crate::sstable::{SsTable, Value, VersionedValue};
 use crate::{log_debug, log_info, log_warn};
 
@@ -29,25 +31,30 @@ const OP_BATCH: u8 = 3;
 
 /// Default memtable size (live + tombstone entries) that triggers a flush.
 const DEFAULT_MEMTABLE_LIMIT: usize = 1024;
+const DEFAULT_MEMTABLE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const DEFAULT_MEMTABLE_VERSIONS_LIMIT: usize = 16_384;
+const DEFAULT_WAL_BYTES_LIMIT: u64 = 128 * 1024 * 1024;
 const DEFAULT_COMPACTION_THRESHOLD: usize = 8;
 
 const TARGET: &str = "kvdb::store";
 
 type MemTable = BTreeMap<Vec<u8>, Vec<VersionedValue>>;
 
+/// Controls when an acknowledged WAL mutation reaches stable storage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Flush userspace buffers and call `sync_data` before acknowledging.
+    #[default]
+    Durable,
+    /// Flush to the operating system, which may still lose data on a crash.
+    Buffered,
+}
+
 /// One mutation inside an atomic [`WriteBatch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchOperation {
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
-}
-
-impl BatchOperation {
-    fn key(&self) -> &[u8] {
-        match self {
-            BatchOperation::Set { key, .. } | BatchOperation::Delete { key } => key,
-        }
-    }
 }
 
 /// A group of mutations committed as one WAL record and one sequence number.
@@ -204,6 +211,8 @@ pub struct Store {
     memtable: MemTable,
     /// Buffered append-only handle to the WAL file.
     wal: BufWriter<File>,
+    /// Advisory lifetime lock preventing a second writer from opening the store.
+    _lock: File,
     /// Path of the WAL; also the anchor for SSTable / manifest paths.
     wal_path: PathBuf,
     /// Live SSTables, oldest first. Reads scan this in reverse (newest first).
@@ -216,12 +225,22 @@ pub struct Store {
     durable_sequence: u64,
     /// Oldest sequence for which historical reads remain complete.
     history_start: u64,
-    /// Last commit sequence for keys changed since this Store was opened.
-    key_sequences: BTreeMap<Vec<u8>, u64>,
+    /// Approximate payload bytes currently retained by the memtable.
+    memtable_bytes: usize,
+    /// Number of version records currently retained by the memtable.
+    memtable_versions: usize,
+    /// Current WAL file size.
+    wal_bytes: u64,
     /// Flush the memtable once it reaches this many entries.
     memtable_limit: usize,
+    memtable_bytes_limit: usize,
+    memtable_versions_limit: usize,
+    wal_bytes_limit: u64,
     /// Compact after reaching this many SSTables; `None` disables automation.
     compaction_threshold: Option<usize>,
+    durability: Durability,
+    /// An uncertain storage write makes this instance permanently read-only.
+    poisoned: bool,
 }
 
 impl Store {
@@ -230,6 +249,24 @@ impl Store {
     /// from writes that had not yet been flushed, rebuilding the memtable.
     pub fn open<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
         let wal_path = wal_path.as_ref().to_path_buf();
+
+        let lock_path = lock_path(&wal_path);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "store {} is already open by another writer: {error}",
+                    wal_path.display()
+                ),
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
 
         // 1. Load previously-flushed SSTables from the manifest.
         let manifest_path = manifest_path(&wal_path);
@@ -251,6 +288,8 @@ impl Store {
             .create(true)
             .append(true)
             .open(&wal_path)?;
+        let wal_bytes = file.metadata()?.len();
+        let (memtable_bytes, memtable_versions) = memtable_metrics(&memtable);
 
         log_debug!(
             TARGET,
@@ -262,15 +301,23 @@ impl Store {
         Ok(Store {
             memtable,
             wal: BufWriter::new(file),
+            _lock: lock,
             wal_path,
             sstables,
             next_seq,
             sequence,
             durable_sequence: manifest.sequence,
             history_start: manifest.history_start,
-            key_sequences: BTreeMap::new(),
+            memtable_bytes,
+            memtable_versions,
+            wal_bytes,
             memtable_limit: memtable_limit_from_env(),
+            memtable_bytes_limit: memtable_bytes_limit_from_env(),
+            memtable_versions_limit: memtable_versions_limit_from_env(),
+            wal_bytes_limit: wal_bytes_limit_from_env(),
             compaction_threshold: compaction_threshold_from_env(),
+            durability: durability_from_env(),
+            poisoned: false,
         })
     }
 
@@ -313,11 +360,12 @@ impl Store {
     }
 
     /// Returns the value for `key`, if present and not deleted.
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self.lookup(key) {
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        validate_key(key, io::ErrorKind::InvalidInput)?;
+        Ok(match self.lookup(key)? {
             Some(Value::Set(value)) => Some(value),
             _ => None,
-        }
+        })
     }
 
     /// Returns the value visible at `sequence`, if it existed and was live.
@@ -334,18 +382,8 @@ impl Store {
 
     /// Resolves a key across every level, newest to oldest, returning the first
     /// record found (which may be a tombstone). `None` means no level knows it.
-    fn lookup(&self, key: &[u8]) -> Option<Value> {
-        self.lookup_at(key, u64::MAX)
-    }
-
-    fn lookup_at(&self, key: &[u8], sequence: u64) -> Option<Value> {
-        match self.lookup_at_result(key, sequence) {
-            Ok(value) => value,
-            Err(e) => {
-                log_warn!(TARGET, "sstable read failed for a key: {e}");
-                None
-            }
-        }
+    fn lookup(&self, key: &[u8]) -> io::Result<Option<Value>> {
+        self.lookup_at_result(key, u64::MAX)
     }
 
     fn lookup_at_result(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
@@ -371,11 +409,12 @@ impl Store {
 
     /// Inserts or overwrites `key` with `value`, durably. May trigger a flush.
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
+        self.ensure_writable()?;
+        validate_key(&key, io::ErrorKind::InvalidInput)?;
+        validate_value(&value, io::ErrorKind::InvalidInput)?;
         let sequence = self.next_sequence()?;
-        write_set(&mut self.wal, sequence, &key, &value)?;
-        self.wal.flush()?;
-        self.key_sequences.insert(key.clone(), sequence);
-        insert_version(&mut self.memtable, key, sequence, Value::Set(value));
+        self.persist_wal(|wal| write_set(wal, sequence, &key, &value))?;
+        self.insert_memtable_version(key, sequence, Value::Set(value));
         self.sequence = sequence;
         self.maybe_flush()
     }
@@ -384,15 +423,15 @@ impl Store {
     /// existed beforehand (preserving the HTTP layer's 404 semantics). The
     /// delete is stored as a tombstone regardless. May trigger a flush.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+        self.ensure_writable()?;
+        validate_key(key, io::ErrorKind::InvalidInput)?;
         // Existed = there is a live value at some level right now.
-        let existed = matches!(self.lookup(key), Some(Value::Set(_)));
+        let existed = matches!(self.lookup(key)?, Some(Value::Set(_)));
 
         let sequence = self.next_sequence()?;
-        write_delete(&mut self.wal, sequence, key)?;
-        self.wal.flush()?;
+        self.persist_wal(|wal| write_delete(wal, sequence, key))?;
         let key = key.to_vec();
-        self.key_sequences.insert(key.clone(), sequence);
-        insert_version(&mut self.memtable, key, sequence, Value::Tombstone);
+        self.insert_memtable_version(key, sequence, Value::Tombstone);
         self.sequence = sequence;
         self.maybe_flush()?;
         Ok(existed)
@@ -402,17 +441,16 @@ impl Store {
     /// either the complete batch or none of it if the trailing record is torn.
     /// Operations are applied in order, so the last operation for a key wins.
     pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<u64> {
+        self.ensure_writable()?;
         if batch.is_empty() {
             return Ok(self.sequence);
         }
 
+        validate_batch(&batch.operations, io::ErrorKind::InvalidInput)?;
         let sequence = self.next_sequence()?;
-        write_batch(&mut self.wal, sequence, &batch.operations)?;
-        self.wal.flush()?;
+        self.persist_wal(|wal| write_batch(wal, sequence, &batch.operations))?;
         for operation in batch.operations {
-            self.key_sequences
-                .insert(operation.key().to_vec(), sequence);
-            apply_operation(&mut self.memtable, sequence, operation);
+            self.apply_memtable_operation(sequence, operation);
         }
         self.sequence = sequence;
         self.maybe_flush()?;
@@ -427,10 +465,63 @@ impl Store {
 
     /// Flushes the memtable to a new SSTable if it has reached the limit.
     fn maybe_flush(&mut self) -> io::Result<()> {
-        if self.memtable.len() >= self.memtable_limit {
+        if self.memtable.len() >= self.memtable_limit
+            || self.memtable_bytes >= self.memtable_bytes_limit
+            || self.memtable_versions >= self.memtable_versions_limit
+            || self.wal_bytes >= self.wal_bytes_limit
+        {
             self.flush()?;
         }
         Ok(())
+    }
+
+    fn persist_wal(
+        &mut self,
+        write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let result = write(&mut self.wal).and_then(|()| {
+            self.wal.flush()?;
+            if self.durability == Durability::Durable {
+                self.wal.get_ref().sync_data()?;
+            }
+            self.wal_bytes = self.wal.get_ref().metadata()?.len();
+            Ok(())
+        });
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn ensure_writable(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "store is poisoned after an uncertain storage failure; reopen it before writing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_memtable_version(&mut self, key: Vec<u8>, sequence: u64, value: Value) {
+        let change = insert_version(&mut self.memtable, key, sequence, value);
+        self.memtable_bytes = self
+            .memtable_bytes
+            .saturating_sub(change.removed_bytes)
+            .saturating_add(change.added_bytes);
+        if change.new_version {
+            self.memtable_versions = self.memtable_versions.saturating_add(1);
+        }
+    }
+
+    fn apply_memtable_operation(&mut self, sequence: u64, operation: BatchOperation) {
+        match operation {
+            BatchOperation::Set { key, value } => {
+                self.insert_memtable_version(key, sequence, Value::Set(value));
+            }
+            BatchOperation::Delete { key } => {
+                self.insert_memtable_version(key, sequence, Value::Tombstone);
+            }
+        }
     }
 
     /// Flushes the current memtable to a new immutable SSTable and seals the WAL.
@@ -442,6 +533,15 @@ impl Store {
     ///
     /// A no-op on an empty memtable.
     pub fn flush(&mut self) -> io::Result<()> {
+        self.ensure_writable()?;
+        let result = self.flush_inner();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn flush_inner(&mut self) -> io::Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
         }
@@ -477,6 +577,8 @@ impl Store {
         self.sstables.push(SsTable::open(&sst_path)?);
         self.next_seq += 1;
         self.memtable.clear();
+        self.memtable_bytes = 0;
+        self.memtable_versions = 0;
 
         log_info!(
             TARGET,
@@ -506,7 +608,12 @@ impl Store {
     /// remove superseded files. A crash before the manifest update leaves the
     /// old set live; a crash after it leaves harmless orphaned old files.
     pub fn compact(&mut self) -> io::Result<()> {
-        self.compact_sstables(self.history_start)
+        self.ensure_writable()?;
+        let result = self.compact_sstables(self.history_start);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Flushes pending writes and compacts all versions while discarding
@@ -518,6 +625,7 @@ impl Store {
     /// older tables it would otherwise need to shadow. The boundary is durable
     /// and can only move forward.
     pub fn compact_with_retention(&mut self, history_start: u64) -> io::Result<()> {
+        self.ensure_writable()?;
         if history_start < self.history_start {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -534,7 +642,11 @@ impl Store {
         // GC covers the whole Store. Flushing first ensures old versions do not
         // remain in the WAL or memtable and reappear in a later SSTable.
         self.flush()?;
-        self.compact_sstables(history_start)
+        let result = self.compact_sstables(history_start);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     fn compact_sstables(&mut self, history_start: u64) -> io::Result<()> {
@@ -618,6 +730,7 @@ impl Store {
         let file = self.wal.get_mut();
         file.set_len(0)?;
         file.sync_all()?;
+        self.wal_bytes = 0;
         Ok(())
     }
 
@@ -639,23 +752,24 @@ impl Store {
     /// those resolving to a live value -- O(keys), used for the startup summary
     /// and tests rather than a hot path. SSTables deliberately keep only sparse
     /// block indexes in memory.
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> io::Result<usize> {
         let mut keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
-            match sst.keys() {
-                Ok(sstable_keys) => keys.extend(sstable_keys),
-                Err(e) => log_warn!(TARGET, "sstable key scan failed: {e}"),
+            keys.extend(sst.keys()?);
+        }
+        let mut live = 0;
+        for key in keys {
+            if matches!(self.lookup(&key)?, Some(Value::Set(_))) {
+                live += 1;
             }
         }
-        keys.iter()
-            .filter(|k| matches!(self.lookup(k), Some(Value::Set(_))))
-            .count()
+        Ok(live)
     }
 
     /// Whether the store currently exposes no live keys.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
     }
 
     /// Overrides the memtable flush threshold (entries) for this store. Mainly
@@ -665,6 +779,40 @@ impl Store {
         if limit > 0 {
             self.memtable_limit = limit;
         }
+    }
+
+    /// Overrides the approximate memtable byte limit. A zero is ignored.
+    pub fn set_memtable_bytes_limit(&mut self, limit: usize) {
+        if limit > 0 {
+            self.memtable_bytes_limit = limit;
+        }
+    }
+
+    /// Overrides the number of retained memtable versions before a flush.
+    pub fn set_memtable_versions_limit(&mut self, limit: usize) {
+        if limit > 0 {
+            self.memtable_versions_limit = limit;
+        }
+    }
+
+    /// Overrides the WAL byte limit that triggers a memtable flush.
+    pub fn set_wal_bytes_limit(&mut self, limit: u64) {
+        if limit > 0 {
+            self.wal_bytes_limit = limit;
+        }
+    }
+
+    /// Selects whether mutations fsync their WAL data before acknowledgment.
+    pub fn set_durability(&mut self, durability: Durability) {
+        self.durability = durability;
+    }
+
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Overrides the automatic compaction threshold. Values greater than zero
@@ -762,7 +910,7 @@ impl Store {
         } = transaction;
         read_set.extend(overlay.into_keys());
         for key in read_set {
-            let actual = self.key_sequences.get(&key).copied().unwrap_or(0);
+            let actual = self.last_modified_sequence(&key)?;
             if actual > base_sequence {
                 return Err(TransactionError::Conflict {
                     key,
@@ -772,6 +920,19 @@ impl Store {
             }
         }
         Ok(self.write_batch(batch)?)
+    }
+
+    fn last_modified_sequence(&self, key: &[u8]) -> io::Result<u64> {
+        let mut latest = self
+            .memtable
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|version| version.sequence)
+            .unwrap_or(0);
+        for sstable in &self.sstables {
+            latest = latest.max(sstable.latest_sequence(key)?.unwrap_or(0));
+        }
+        Ok(latest)
     }
 
     /// Path to the backing WAL file.
@@ -876,6 +1037,12 @@ fn stem(wal_path: &Path) -> String {
 /// The manifest path, `<dir>/<stem>.manifest`.
 fn manifest_path(wal_path: &Path) -> PathBuf {
     parent_dir(wal_path).join(format!("{}.manifest", stem(wal_path)))
+}
+
+fn lock_path(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 /// The SSTable file name for a sequence number, e.g. `kvdb-000007.sst`.
@@ -995,6 +1162,17 @@ fn write_manifest(
     }
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    File::open(parent_dir(path))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -1061,19 +1239,63 @@ fn apply_operation(map: &mut MemTable, sequence: u64, operation: BatchOperation)
     }
 }
 
-fn insert_version(map: &mut MemTable, key: Vec<u8>, sequence: u64, value: Value) {
+struct InsertChange {
+    added_bytes: usize,
+    removed_bytes: usize,
+    new_version: bool,
+}
+
+fn insert_version(map: &mut MemTable, key: Vec<u8>, sequence: u64, value: Value) -> InsertChange {
+    let key_is_new = !map.contains_key(&key);
+    let key_bytes = key.len();
     let versions = map.entry(key).or_default();
     if let Some(last) = versions.last_mut()
         && last.sequence == sequence
     {
+        let removed_bytes = value_bytes(&last.value);
+        let added_bytes = value_bytes(&value);
         last.value = value;
-        return;
+        return InsertChange {
+            added_bytes,
+            removed_bytes,
+            new_version: false,
+        };
     }
+    let added_bytes =
+        key_is_new as usize * key_bytes + size_of::<VersionedValue>() + value_bytes(&value);
     versions.push(VersionedValue { sequence, value });
+    InsertChange {
+        added_bytes,
+        removed_bytes: 0,
+        new_version: true,
+    }
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Set(value) => value.len(),
+        Value::Tombstone => 0,
+    }
+}
+
+fn memtable_metrics(memtable: &MemTable) -> (usize, usize) {
+    let mut bytes = 0usize;
+    let mut version_count = 0usize;
+    for (key, versions) in memtable {
+        bytes = bytes.saturating_add(key.len());
+        for version in versions {
+            bytes = bytes
+                .saturating_add(size_of::<VersionedValue>())
+                .saturating_add(value_bytes(&version.value));
+            version_count = version_count.saturating_add(1);
+        }
+    }
+    (bytes, version_count)
 }
 
 /// Encodes a SET record: `[OP_SET][sequence][key_len][key][val_len][value]`.
 fn write_set<W: Write>(w: &mut W, sequence: u64, key: &[u8], value: &[u8]) -> io::Result<()> {
+    validate_set_record(key, value, io::ErrorKind::InvalidInput)?;
     w.write_all(&[OP_SET])?;
     w.write_all(&sequence.to_be_bytes())?;
     write_chunk(w, key)?;
@@ -1083,6 +1305,7 @@ fn write_set<W: Write>(w: &mut W, sequence: u64, key: &[u8], value: &[u8]) -> io
 
 /// Encodes a DELETE record: `[OP_DELETE][sequence][key_len][key]`.
 fn write_delete<W: Write>(w: &mut W, sequence: u64, key: &[u8]) -> io::Result<()> {
+    validate_delete_record(key, io::ErrorKind::InvalidInput)?;
     w.write_all(&[OP_DELETE])?;
     w.write_all(&sequence.to_be_bytes())?;
     write_chunk(w, key)?;
@@ -1096,8 +1319,8 @@ fn write_batch<W: Write>(
     sequence: u64,
     operations: &[BatchOperation],
 ) -> io::Result<()> {
-    let count = u32::try_from(operations.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "batch is too large"))?;
+    validate_batch(operations, io::ErrorKind::InvalidInput)?;
+    let count = operations.len() as u32;
     w.write_all(&[OP_BATCH])?;
     w.write_all(&sequence.to_be_bytes())?;
     w.write_all(&count.to_be_bytes())?;
@@ -1129,8 +1352,9 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     match op[0] {
         OP_SET => {
             let sequence = read_sequence(r)?;
-            let key = read_chunk(r)?;
-            let value = read_chunk(r)?;
+            let key = read_chunk(r, MAX_KEY_BYTES, "WAL key")?;
+            let value = read_chunk(r, MAX_VALUE_BYTES, "WAL value")?;
+            validate_set_record(&key, &value, io::ErrorKind::InvalidData)?;
             Ok(Some(Record::Set {
                 sequence,
                 key,
@@ -1139,16 +1363,21 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
         }
         OP_DELETE => {
             let sequence = read_sequence(r)?;
-            let key = read_chunk(r)?;
+            let key = read_chunk(r, MAX_KEY_BYTES, "WAL key")?;
+            validate_delete_record(&key, io::ErrorKind::InvalidData)?;
             Ok(Some(Record::Delete { sequence, key }))
         }
         OP_BATCH => {
             let sequence = read_sequence(r)?;
             let count = read_u32(r)? as usize;
-            let mut operations = Vec::new();
+            if count > MAX_BATCH_OPERATIONS {
+                return Err(invalid_data("WAL batch operation count exceeds limit"));
+            }
+            let mut operations = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
                 operations.push(read_batch_operation(r)?);
             }
+            validate_batch(&operations, io::ErrorKind::InvalidData)?;
             Ok(Some(Record::Batch {
                 sequence,
                 operations,
@@ -1164,11 +1393,11 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
 fn read_batch_operation<R: Read>(r: &mut R) -> io::Result<BatchOperation> {
     match read_u8(r)? {
         OP_SET => Ok(BatchOperation::Set {
-            key: read_chunk(r)?,
-            value: read_chunk(r)?,
+            key: read_chunk(r, MAX_KEY_BYTES, "WAL batch key")?,
+            value: read_chunk(r, MAX_VALUE_BYTES, "WAL batch value")?,
         }),
         OP_DELETE => Ok(BatchOperation::Delete {
-            key: read_chunk(r)?,
+            key: read_chunk(r, MAX_KEY_BYTES, "WAL batch key")?,
         }),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1185,11 +1414,80 @@ fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Reads a length-prefixed byte chunk (`[u32 len][bytes]`).
-fn read_chunk<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_chunk<R: Read>(r: &mut R, max: usize, field: &str) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
+    if len > max {
+        return Err(invalid_data(format!("{field} exceeds size limit")));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn validate_key(key: &[u8], kind: io::ErrorKind) -> io::Result<()> {
+    if key.len() > MAX_KEY_BYTES {
+        return Err(io::Error::new(kind, "key exceeds size limit"));
+    }
+    Ok(())
+}
+
+fn validate_value(value: &[u8], kind: io::ErrorKind) -> io::Result<()> {
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(io::Error::new(kind, "value exceeds size limit"));
+    }
+    Ok(())
+}
+
+fn validate_set_record(key: &[u8], value: &[u8], kind: io::ErrorKind) -> io::Result<()> {
+    validate_key(key, kind)?;
+    validate_value(value, kind)?;
+    let len = 1usize
+        .checked_add(8)
+        .and_then(|len| len.checked_add(4 + key.len()))
+        .and_then(|len| len.checked_add(4 + value.len()))
+        .ok_or_else(|| io::Error::new(kind, "WAL record size overflow"))?;
+    if len > MAX_WAL_RECORD_BYTES {
+        return Err(io::Error::new(kind, "WAL record exceeds size limit"));
+    }
+    Ok(())
+}
+
+fn validate_delete_record(key: &[u8], kind: io::ErrorKind) -> io::Result<()> {
+    validate_key(key, kind)
+}
+
+fn validate_batch(operations: &[BatchOperation], kind: io::ErrorKind) -> io::Result<()> {
+    if operations.len() > MAX_BATCH_OPERATIONS {
+        return Err(io::Error::new(kind, "batch operation count exceeds limit"));
+    }
+    let mut len = 1usize + 8 + 4;
+    for operation in operations {
+        let operation_len = match operation {
+            BatchOperation::Set { key, value } => {
+                validate_key(key, kind)?;
+                validate_value(value, kind)?;
+                1usize
+                    .checked_add(4 + key.len())
+                    .and_then(|len| len.checked_add(4 + value.len()))
+            }
+            BatchOperation::Delete { key } => {
+                validate_key(key, kind)?;
+                1usize.checked_add(4 + key.len())
+            }
+        }
+        .ok_or_else(|| io::Error::new(kind, "WAL batch size overflow"))?;
+        len = len
+            .checked_add(operation_len)
+            .ok_or_else(|| io::Error::new(kind, "WAL batch size overflow"))?;
+        if len > MAX_WAL_RECORD_BYTES {
+            return Err(io::Error::new(kind, "WAL batch exceeds size limit"));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
@@ -1231,6 +1529,36 @@ fn memtable_limit_from_env() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MEMTABLE_LIMIT)
+}
+
+fn memtable_bytes_limit_from_env() -> usize {
+    positive_usize_env("KVDB_MEMTABLE_BYTES_LIMIT").unwrap_or(DEFAULT_MEMTABLE_BYTES_LIMIT)
+}
+
+fn memtable_versions_limit_from_env() -> usize {
+    positive_usize_env("KVDB_MEMTABLE_VERSIONS_LIMIT").unwrap_or(DEFAULT_MEMTABLE_VERSIONS_LIMIT)
+}
+
+fn wal_bytes_limit_from_env() -> u64 {
+    std::env::var("KVDB_WAL_BYTES_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_WAL_BYTES_LIMIT)
+}
+
+fn positive_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+}
+
+fn durability_from_env() -> Durability {
+    match std::env::var("KVDB_DURABILITY") {
+        Ok(value) if value.eq_ignore_ascii_case("buffered") => Durability::Buffered,
+        _ => Durability::Durable,
+    }
 }
 
 /// Reads `KVDB_COMPACTION_THRESHOLD`. Zero disables automatic compaction;

@@ -21,9 +21,12 @@ tests/
 └── http.rs       — HTTP router tests (auth, CRUD) via tower oneshot
 ```
 
-**Durability guarantee:** every mutation is first appended to the WAL and flushed
-to disk, and only then applied to the memtable. A record left torn by a crash
-mid-write is treated as uncommitted and dropped during recovery.
+**Durability guarantee:** by default every mutation is appended to the WAL,
+flushed, and synchronized with `sync_data` before it is applied to the memtable
+or acknowledged. A trailing record left torn by a crash is treated as
+uncommitted and dropped during recovery. `KVDB_DURABILITY=buffered` is an
+explicit performance mode that flushes only to the operating system and can
+lose acknowledged writes after an OS crash or power loss.
 
 ## REST API
 
@@ -58,7 +61,7 @@ cargo test           # fast suite: storage engine + HTTP router tests
 
 # Heavier suites are opt-in (kept out of the default run):
 cargo test --release --test load -- --ignored --nocapture --test-threads=1
-cargo test --release --test perf -- --ignored --nocapture --test-threads=1
+KVDB_DURABILITY=buffered cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 ```
 
 GitHub Actions runs formatting, Clippy, the fast suite, sequential release load
@@ -112,10 +115,10 @@ is a mean, not a p95/p99. Setup/population is outside the measured interval.
 | HTTP PUT through Axum router, no TCP | 20k requests | 48,736 req/s | 20.519 us/req |
 
 The HTTP rows include routing, Basic auth, body handling, mutex locking, and the
-Store operation, but deliberately exclude socket/network overhead. WAL `flush`
-means flushing Rust's buffered writer to the OS; kvdb does not currently call
-`sync_data` for every mutation, so these numbers must not be read as fsync-level
-durability latency.
+Store operation, but deliberately exclude socket/network overhead. These
+2026-07-18 figures were collected in the now-explicit `buffered` durability
+mode and must not be read as fsync-level durability latency. The default
+`durable` mode calls `sync_data` for every mutation.
 
 Disk footprint from the same runs:
 
@@ -157,9 +160,13 @@ KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
 Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
 (`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
 order together with the latest durable commit sequence and retained-history
-boundary. When the memtable grows past `KVDB_MEMTABLE_LIMIT` entries (default
-`1024`) it is flushed to a new SSTable, the manifest is updated, and the WAL is
-truncated. Each key record
+boundary. Only one `Store` may hold a WAL at a time; a sibling `.wal.lock` file
+is held with an operating-system advisory lock for the Store's lifetime. The
+memtable is flushed when any configured key, byte, version, or WAL byte limit is
+reached (`KVDB_MEMTABLE_LIMIT`, `KVDB_MEMTABLE_BYTES_LIMIT`,
+`KVDB_MEMTABLE_VERSIONS_LIMIT`, `KVDB_WAL_BYTES_LIMIT`). Defaults are 1024 keys,
+64 MiB, 16384 versions, and 128 MiB respectively. The manifest is then updated
+and the WAL truncated. Each key record
 contains its versions in ascending commit-sequence order. SSTables group those
 records into 64-entry blocks with a persisted
 **sparse index** (one first-key + byte range per block) and a **Bloom filter**.
