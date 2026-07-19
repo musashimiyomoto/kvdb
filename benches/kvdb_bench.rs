@@ -89,6 +89,9 @@ impl Config {
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                // Cargo passes this marker to benchmark executables even when
+                // the built-in libtest harness is disabled.
+                "--bench" => {}
                 "--profile" => {
                     profile = Profile::parse(&args.next().expect("--profile requires a value"));
                 }
