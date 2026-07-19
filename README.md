@@ -2,23 +2,29 @@
 
 A small **networked key-value database** written in Rust, exposed over an
 **HTTP/REST API** with HTTP Basic authentication. It's a learning project that
-mirrors the starting architecture of LSM-tree engines (RocksDB, LevelDB): data
-lives in memory and is durably journaled to disk through a write-ahead log
-(WAL), which is replayed on startup to rebuild state.
+mirrors the core architecture of LSM-tree engines (RocksDB, LevelDB): recent
+writes live in a memtable and a write-ahead log (WAL), while flushed data lives
+in immutable SSTables. On startup, the manifest is loaded first and the WAL is
+then replayed over the listed tables.
 
 ## Architecture
 
 ```
 src/
-├── lib.rs        — module exports
-├── store.rs      — storage engine: memtable (BTreeMap) + WAL + recovery
-├── http.rs       — axum router, REST handlers, Basic-auth middleware
+├── lib.rs        — public module exports
+├── store.rs      — WAL, memtable, manifest, recovery, MVCC, compaction
+├── sstable.rs    — SSTable codec, sparse index, and Bloom filter
+├── limits.rs     — storage input and allocation limits
+├── http.rs       — Axum router, REST handlers, Basic-auth middleware
+├── log.rs        — dependency-free structured line logging
 └── bin/
     ├── server.rs — HTTP server (axum + tokio)
     └── client.rs — HTTP client: interactive REPL and one-shot mode
 tests/
 ├── store.rs      — storage engine integration tests
-└── http.rs       — HTTP router tests (auth, CRUD) via tower oneshot
+├── http.rs       — HTTP router tests via tower oneshot
+├── load.rs       — ignored release-mode correctness workloads
+└── perf.rs       — ignored informational performance scenarios
 ```
 
 **Durability guarantee:** by default every mutation is appended to the WAL,
@@ -56,13 +62,15 @@ Clients authenticate with HTTP Basic auth (`curl -u user:pass`, or the
 ## Build
 
 ```sh
-cargo build --release
-cargo test           # fast suite: storage engine + HTTP router tests
+cargo build --release --locked
+cargo test --all --locked  # fast suite: storage engine + HTTP router tests
 
 # Heavier suites are opt-in (kept out of the default run):
-cargo test --release --test load -- --ignored --nocapture --test-threads=1
-KVDB_DURABILITY=buffered cargo test --release --test perf -- --ignored --nocapture --test-threads=1
+cargo test --release --locked --test load -- --ignored --nocapture --test-threads=1
+KVDB_DURABILITY=buffered cargo test --release --locked --test perf -- --ignored --nocapture --test-threads=1
 ```
+
+The repository pins Rust 1.96.0 in `rust-toolchain.toml`.
 
 GitHub Actions runs formatting, Clippy, the fast suite, sequential release load
 tests, informational benchmarks, and a Docker persistence smoke test on every
@@ -157,19 +165,28 @@ KVDB_USER=admin KVDB_PASSWORD=secret cargo run --bin kvdb-server
 
 ### Storage layout
 
-Alongside the WAL (`kvdb.wal`), a full store keeps sorted **SSTable** files
-(`kvdb-000001.sst`, …) and a **manifest** (`kvdb.manifest`) that lists them in
-order together with the latest durable commit sequence and retained-history
-boundary. Only one `Store` may hold a WAL at a time; a sibling `.wal.lock` file
-is held with an operating-system advisory lock for the Store's lifetime. The
-memtable is flushed when any configured key, byte, version, or WAL byte limit is
-reached (`KVDB_MEMTABLE_LIMIT`, `KVDB_MEMTABLE_BYTES_LIMIT`,
-`KVDB_MEMTABLE_VERSIONS_LIMIT`, `KVDB_WAL_BYTES_LIMIT`). Defaults are 1024 keys,
-64 MiB, 16384 versions, and 128 MiB respectively. The manifest is then updated
-and the WAL truncated. Each key record
-contains its versions in ascending commit-sequence order. SSTables group those
-records into 64-entry blocks with a persisted
-**sparse index** (one first-key + byte range per block) and a **Bloom filter**.
+Alongside `kvdb.wal`, the store may create **SSTable** generations named
+`kvdb-000000.sst`, `kvdb-000001.sst`, and so on. Records inside each SSTable
+are sorted by key. The **manifest** is `kvdb.manifest`; it lists live tables
+from oldest to newest and records the latest durable commit sequence and
+retained-history boundary. A sibling lock file, `kvdb.wal.lock`, is held with
+an operating-system advisory lock for the `Store` lifetime, so a second writer
+cannot open the same WAL.
+
+The memtable is flushed when the first configured limit is reached:
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `KVDB_MEMTABLE_LIMIT` | 1024 | distinct memtable keys |
+| `KVDB_MEMTABLE_BYTES_LIMIT` | 64 MiB | approximate memtable payload bytes |
+| `KVDB_MEMTABLE_VERSIONS_LIMIT` | 16384 | retained memtable versions |
+| `KVDB_WAL_BYTES_LIMIT` | 128 MiB | WAL file size |
+| `KVDB_COMPACTION_THRESHOLD` | 8 | SSTable count; `0` disables automatic compaction |
+
+After a successful flush, the manifest is updated and the WAL is truncated.
+Each SSTable key record contains its versions in ascending commit-sequence
+order. Tables group records into 64-entry blocks with a persisted **sparse
+index** (one first key and byte range per block) and a **Bloom filter**.
 Opening a table does not load every key into memory; a Bloom negative skips the
 file entirely, while a possible hit binary-searches the index and scans one
 block. Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the
@@ -190,13 +207,16 @@ applies either every operation or none of them if the trailing record is torn:
 ```rust
 use kvdb::{Store, WriteBatch};
 
-let mut store = Store::open("kvdb.wal")?;
-let mut batch = WriteBatch::new();
-batch
-    .set(b"user:1".to_vec(), b"Alice".to_vec())
-    .delete(b"user:old".to_vec());
-let sequence = store.write_batch(batch)?;
-# Ok::<(), std::io::Error>(())
+fn main() -> std::io::Result<()> {
+    let mut store = Store::open("kvdb.wal")?;
+    let mut batch = WriteBatch::new();
+    batch
+        .set(b"user:1".to_vec(), b"Alice".to_vec())
+        .delete(b"user:old".to_vec());
+    let sequence = store.write_batch(batch)?;
+    println!("committed at sequence {sequence}");
+    Ok(())
+}
 ```
 
 `Store::snapshot()` returns an immutable read-only copy of all currently visible
@@ -257,7 +277,8 @@ kvdb> PING
 PONG
 ```
 
-One-shot (handy for scripts); credentials via env or `--user`/`--password`:
+One-shot invocation; credentials can come from the environment or from
+`--user`/`--password`:
 
 ```sh
 cargo run --bin kvdb-client -- http://127.0.0.1:6380 --user admin --password secret SET counter 42
@@ -288,8 +309,9 @@ memtables, indexed and Bloom-filtered SSTables, atomic batches, snapshots,
 optimistic transactions, MVCC retention, compaction, HTTP access, load tests,
 and a local performance baseline are implemented.
 
-The next work is reliability-first: make acknowledged durability real, bound
-recovery and memory use, propagate storage failures correctly, isolate blocking
-I/O from the async server, and make delivery reproducible before adding more
-database features. See the [prioritized roadmap](ROADMAP.md) for the audit
-findings, milestones, and acceptance criteria.
+The first persistence-hardening pass is complete: durable mode calls
+`sync_data`, recovery allocations are bounded, storage read failures propagate,
+memory/WAL flush limits are enforced, and a second writer is rejected. The next
+work is checksummed file formats and crash-injection tests, followed by moving
+blocking storage I/O off async request workers. See the
+[prioritized roadmap](ROADMAP.md) for current status and acceptance criteria.

@@ -2,193 +2,158 @@
 
 Last reviewed: 2026-07-19.
 
-This roadmap starts from the repository as it exists today. The LSM-tree
-learning milestones are implemented and well covered by logical correctness
-tests. The next goal is to turn that foundation into a trustworthy single-node
-service before adding more database features.
+kvdb now has a working single-node LSM-style storage engine and its first
+persistence-hardening pass. The immediate goal is to finish corruption and
+crash handling before expanding the network API or adding new database
+features.
 
-## Audit baseline
+## Verified baseline
 
-The review covered every source, test, workflow, container, and documentation
-file in the repository. On Rust 1.97.1 the following checks pass:
+The repository pins Rust 1.96.0 for local, CI, and Docker builds. The following
+checks pass on that toolchain:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
-- `cargo test --all --locked` (53 passing tests, 19 intentionally ignored)
-- release load suite (4 passing tests)
-- release performance suite (15 passing informational scenarios)
+- `cargo test --all --locked` (60 passing tests, 19 intentionally ignored)
 
-The Dockerfile's Rust 1.96 build could not be reproduced during this review
-because Docker Hub was unavailable. CI and local builds use the lockfile, while
-the current Docker build does not.
+The four ignored load tests and 15 ignored performance scenarios remain
+separate release-mode jobs in CI. Docker copies `Cargo.lock`, builds with
+`--locked`, runs as a non-root user, and has a persistence smoke test in CI.
 
-## Implementation progress
+## Completed hardening
 
-First P0 hardening increment (2026-07-19):
+The following findings from the original audit are implemented. Storage
+behaviors have regression coverage in `tests/store.rs` and `tests/http.rs`:
 
-- **Implemented R1:** default mutations now flush and call `sync_data`; buffered
-  durability is explicit and documented.
-- **Implemented R3:** current reads and key counts propagate storage errors;
-  HTTP no longer turns SSTable failures into `404` responses.
-- **Implemented R4:** memtable key, byte, version, and WAL byte limits trigger
-  flush independently; transaction conflict detection no longer keeps an
-  unbounded per-key map.
-- **Implemented R5:** public writes plus WAL/SSTable decoders enforce hard key,
-  value, batch, version, record, and Bloom metadata bounds before allocation.
-- **Implemented R6:** an advisory lifetime lock rejects a second writable Store
-  for the same WAL.
-- **Partially implemented R2/R7:** uncertain storage writes poison the Store,
-  and SSTable/manifest renames fsync their parent directory. Versioned frames,
-  checksums, failpoint crash tests, and format migration remain open.
-- **Implemented the reproducibility portion of R12:** the repository, CI, and
-  Docker now target Rust 1.96.0, and Docker consumes `Cargo.lock` with
-  `--locked`. Supply-chain scanning and action SHA pinning remain open.
+- **R1 - acknowledged durability:** the default `durable` mode flushes and
+  calls `sync_data` before acknowledging each mutation. The explicitly weaker
+  `buffered` mode is opt-in.
+- **R3 - fallible reads:** SSTable read failures propagate through `Store` and
+  become HTTP storage errors instead of false `404 Not Found` responses.
+- **R4 - bounded mutable state:** distinct-key, approximate-byte, version-count,
+  and WAL-byte limits can each trigger a memtable flush. Transaction conflict
+  checks no longer retain an unbounded per-key sequence map.
+- **R5 - bounded codecs:** public writes and WAL/SSTable decoders enforce key,
+  value, batch, version, record, index, and Bloom metadata limits before large
+  allocations.
+- **R6 - single writer:** an advisory lifetime lock rejects a second writable
+  `Store` for the same WAL.
+- **R12 - reproducible Rust build:** `rust-toolchain.toml`, CI, and Docker use
+  Rust 1.96.0; Docker consumes the repository lockfile with `--locked`.
 
-The risk table below is the original audit snapshot; this progress section is
-the current source of status until each risk is fully closed.
+Storage writes also fail closed: an uncertain WAL, flush, or compaction error
+poisons that `Store` instance, and publishing an SSTable or manifest fsyncs its
+parent directory on Unix. These changes reduce R2 and R7 but do not close them
+because file formats still lack checksums and crash-point coverage.
 
-## Current risk register
+## Remaining risk register
 
-The order below reflects correctness and operational impact, not implementation
-convenience.
-
-| ID | Priority | Current issue | Impact |
+| ID | Priority | Status | Remaining risk |
 |---|---|---|---|
-| R1 | P0 | `Store::set`, `delete`, and `write_batch` acknowledge after `BufWriter::flush`, without `File::sync_data` | An OS crash or power loss can lose acknowledged writes; the current durability wording is stronger than the implementation |
-| R2 | P0 | A partial WAL write leaves the same `Store` usable and WAL records have no frame checksum | Continuing after disk-full or short-write errors can append behind a torn record and make later recovery fail |
-| R3 | P0 | `Store::lookup_at` logs SSTable read errors and returns `None` | Corruption or I/O failure can be reported as a legitimate missing key; DELETE can also make the wrong existence decision |
-| R4 | P0 | The memtable limit counts distinct keys, not bytes or versions | Repeated writes to one hot key can grow memory and the WAL without triggering a flush |
-| R5 | P0 | WAL and SSTable data decoders allocate from untrusted length/count fields before enforcing configured bounds | A small malformed file can cause excessive allocation or recovery-time denial of service |
-| R6 | P0 | There is no exclusive data-directory/process lock | Two server processes can open the same WAL and corrupt sequence, manifest, and SSTable state |
-| R7 | P1 | SSTable data, WAL records, and the text manifest have no integrity checksum; rename operations do not fsync the parent directory | Bit rot can become silent wrong data, and metadata persistence across a machine crash is not fully specified |
-| R8 | P1 | Axum handlers hold `std::sync::Mutex<Store>` while doing blocking filesystem I/O | A slow disk blocks Tokio workers and all requests; there is no queue bound or write backpressure |
-| R9 | P1 | Basic credentials are sent over plain HTTP; the client accepts an `https://` URL but reqwest is built without TLS | Credentials are exposed off-host and the advertised client URL scheme is inconsistent with its build |
-| R10 | P1 | The client treats HTTP error statuses as a successful command and converts all values to text | Scripts receive exit code 0 for 401/404/500, and the bundled client does not preserve arbitrary binary values |
-| R11 | P1 | The HTTP API uses UTF-8 path keys and an implicit Axum body limit while library docs promise arbitrary bytes | Limits and binary-key behavior are inconsistent across the library, REST API, and client |
-| R12 | P1 | Docker omits `Cargo.lock` and does not use `--locked`; no repository toolchain/MSRV file exists | The image can resolve a dependency graph different from CI and may drift beyond Rust 1.96 compatibility |
-| R13 | P2 | Compaction materializes every live SSTable in memory and runs inline with the triggering write | Large compactions can multiply peak memory and create long write/request stalls |
-| R14 | P2 | Liveness does not distinguish readiness; there are no timeouts, graceful shutdown, metrics, backup, verify, or repair commands | Operators cannot reliably detect degradation, drain the server, or recover data |
+| R2 | P0 | Partial | WAL records are not versioned, length-delimited frames and have no checksum; crash/failpoint tests do not yet exercise every write boundary. |
+| R7 | P0 | Partial | WAL records, SSTable blocks, and manifest metadata have no integrity checksums or documented format-migration path. |
+| R8 | P1 | Open | Axum handlers hold `std::sync::Mutex<Store>` during blocking filesystem I/O, so a slow disk can block request workers. |
+| R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` URLs even though reqwest is built without TLS. |
+| R10 | P1 | Open | One-shot client commands print HTTP errors but still exit successfully, and response values are always decoded as text. |
+| R11 | P1 | Open | The REST API exposes UTF-8 path keys and an implicit Axum body limit, while the library accepts binary keys and values up to its own limits. |
+| R12 | P1 | Partial | GitHub Actions still use mutable version tags; dependency policy, vulnerability scanning, SBOM generation, and image metadata remain open. |
+| R13 | P2 | Open | Full compaction materializes all live SSTables in memory and runs inline with the triggering write. |
+| R14 | P2 | Open | There is no readiness probe, graceful shutdown, metrics, backup, verify, or repair command. |
 
-## Milestone 0: trustworthy persistence (P0)
+## Milestone 0: trustworthy persistence (P0, in progress)
 
-Complete this milestone before treating kvdb as durable storage.
+### Done
 
-### 0.1 Define and enforce the durability contract
+- [x] Sync acknowledged writes by default and document buffered durability.
+- [x] Poison a store after uncertain storage writes.
+- [x] Fsync the parent directory after publishing SSTables and manifests on
+  Unix.
+- [x] Make current reads fallible and propagate storage errors through HTTP.
+- [x] Bound public inputs and WAL/SSTable decoder allocations.
+- [x] Bound memtable keys, bytes, versions, and WAL size.
+- [x] Enforce one writable process per WAL with a lifetime lock.
 
-- Add explicit durability modes, with `sync_data` before acknowledging a write
-  in the default `durable` mode. If a buffered mode remains, name and document
-  its data-loss window rather than calling it durable.
-- Fsync the containing directory after publishing or replacing SSTables and the
-  manifest. Document the supported filesystem and rename assumptions.
-- Put the store into a fail-stop/poisoned state after any uncertain WAL, flush,
-  manifest, or compaction write. Only reopen/recovery may make it writable again.
-- Return structured storage errors that distinguish invalid input, corruption,
-  unavailable I/O, conflicts, and internal invariant failures.
+### Next
 
-Acceptance: after every acknowledged durable write, forced process/machine-crash
-tests recover that write; after injected short-write/disk-full errors, no later
-write is accepted by the same store instance.
+- [ ] Introduce a versioned, length-delimited WAL frame with a checksum while
+  retaining an explicit migration path from the current format.
+- [ ] Add per-block SSTable checksums and checksummed manifest metadata.
+- [ ] Bound manifest line/count parsing and validate filenames, duplicate
+  entries, table order, sequence bounds, and table metadata during open.
+- [ ] Add failpoints around WAL write/sync, SSTable sync/rename, manifest
+  sync/rename, WAL truncation, and obsolete-table deletion. Kill a child
+  process at each point and compare recovery with acknowledged operations.
+- [ ] Replace broad `io::Error` reporting with structured errors for invalid
+  input, corruption, unavailable I/O, conflicts, and poisoned state.
+- [ ] Define the supported filesystem/rename assumptions and a safe policy for
+  cleaning temporary and orphan files.
 
-### 0.2 Make recovery bounded and corruption explicit
-
-- Introduce a versioned, length-delimited WAL frame with maximum record, key,
-  value, operation-count, and version-count limits plus a checksum.
-- Apply the same configured bounds to SSTable records, indexes, Bloom metadata,
-  manifests, snapshots, batches, and HTTP bodies before allocating.
-- Change current reads to a fallible API (`io::Result<Option<Vec<u8>>>` or a
-  domain error) and propagate SSTable failures to HTTP as unavailable/corrupt,
-  never as `404`.
-- Add checksums per SSTable block and for manifest metadata. Define a migration
-  path that can read version 1 files and writes the new format atomically.
-- Validate manifest filenames, table ordering, sequence bounds, duplicate
-  entries, and table metadata against the manifest during open.
-
-Acceptance: fuzzed/truncated/corrupted files never panic or allocate beyond the
-configured budget, and every corruption is either rejected during open or
-surfaced by the read that encounters it.
-
-### 0.3 Bound memory and enforce single ownership
-
-- Track memtable resident bytes, version count, and WAL bytes in addition to
-  distinct keys. Flush/backpressure on the first configured limit reached.
-- Bound or replace the ever-growing `key_sequences` transaction-conflict map.
-- Acquire an exclusive lock for the store directory/WAL lifetime; a second
-  writer must fail with a clear startup error.
-- Clean stale temporary/orphan files only after proving they are not referenced
-  by the durable manifest.
-
-Acceptance: a hot-key workload stays within its memory/WAL budget, and a second
-process cannot mutate the same store.
+Acceptance: every acknowledged durable write survives the tested crash matrix;
+corrupted or truncated data is rejected without panic or excessive allocation;
+and an uncertain write prevents all later writes until reopen/recovery.
 
 ## Milestone 1: production-safe service boundary (P1)
 
-### 1.1 Move storage I/O off async request workers
+### 1.1 Isolate blocking storage work
 
-- Give one dedicated blocking storage worker ownership of `Store`; communicate
+- Give one dedicated blocking worker ownership of `Store` and communicate
   through a bounded request queue with cancellation and overload responses.
 - Add optional group commit so concurrent durable writes can share an fsync
-  without weakening the selected durability contract.
-- Separate `/live` from `/ready`; readiness must fail when storage is poisoned,
-  the queue is saturated for too long, or recovery has not completed.
-- Add connection, request-body, key/value, concurrency, and request-timeout
-  limits. Implement graceful SIGTERM/SIGINT drain and final state reporting.
+  without weakening the selected durability mode.
+- Split `/live` from `/ready`; readiness must fail while recovery is incomplete,
+  storage is poisoned, or the queue remains saturated.
+- Add connection, request-body, key/value, concurrency, and request timeout
+  limits, plus graceful SIGTERM/SIGINT draining.
 
-Acceptance: slow-disk tests do not block unrelated Tokio tasks, overload is
-bounded and observable, and shutdown either completes queued acknowledged work
-or clearly rejects it.
+Acceptance: slow-disk tests do not block unrelated Tokio tasks, overload stays
+bounded and observable, and shutdown either completes accepted work or clearly
+rejects it.
 
-### 1.2 Make the API and client contracts precise
+### 1.2 Define the HTTP and client contracts
 
-- Choose one binary-key representation for HTTP (for example base64url) or
-  explicitly define the REST API as UTF-8-only. Keep raw response bodies for
-  binary values and publish exact size limits.
-- Add versioned machine-readable errors and stable mappings for not-found,
-  conflict, invalid input, too-large, unavailable, and corruption cases.
-- Expose atomic batch writes and compare-and-set before exposing the current
-  in-process transaction object over the network.
+- Choose a binary-key representation such as base64url, or explicitly define
+  the REST API as UTF-8-only. Preserve raw value bytes and publish exact limits.
+- Add versioned machine-readable errors and stable mappings for not found,
+  conflict, invalid input, too large, unavailable, and corruption.
+- Expose atomic batches and compare-and-set before considering remote
+  transactions.
 - Make one-shot client commands return non-zero for authentication, transport,
-  server, and unexpected not-found errors; add strict argument validation,
-  timeouts, raw file/stdin input, and raw stdout output.
-- Either add rustls HTTPS support to the client/server or formally require a TLS
-  reverse proxy and reject/document plaintext Basic Auth outside trusted local
-  deployments. Add authentication throttling.
+  server, and unexpected not-found errors. Add strict argument validation,
+  timeouts, raw stdin/file input, and raw stdout output.
+- Add rustls HTTPS support or formally require a TLS reverse proxy and reject or
+  document plaintext Basic Auth outside trusted local deployments.
 
-Acceptance: TCP-level integration tests cover binary data, status/exit-code
-mapping, limits, timeouts, TLS policy, and server restart behavior.
+Acceptance: TCP-level tests cover binary data, limits, status/exit-code mapping,
+timeouts, the TLS policy, and server restart behavior.
 
-### 1.3 Reproducible and secure delivery
+### 1.3 Secure delivery
 
-- Copy `Cargo.lock` into the Docker build and use `cargo build --locked`; add a
-  pinned `rust-toolchain.toml` or documented MSRV tested in CI.
-- Pin GitHub Actions by commit SHA, add dependency/license policy (`cargo-deny`)
-  and vulnerability scanning, and schedule dependency updates.
+- Pin GitHub Actions by commit SHA and add dependency/license policy,
+  vulnerability scanning, and scheduled dependency updates.
 - Add OCI labels, a container `HEALTHCHECK`, read-only-root-filesystem guidance,
-  an SBOM, and a non-root persistence smoke test using the exact release image.
-- Split correctness benchmarks from historical machine-specific numbers in the
-  README; retain raw benchmark artifacts and track regressions on a controlled
-  runner before introducing gates.
+  an SBOM, and a non-root persistence test using the exact release image.
+- Keep load tests correctness-only. Track statistical performance regressions
+  on a controlled runner before introducing timing gates.
 
-Acceptance: local, CI, and Docker builds use the same locked dependency graph
-and supported Rust version; image and dependency scans have no untriaged high
-severity findings.
+Acceptance: builds use the same locked dependency graph and Rust version, and
+dependency/image scans have no untriaged high-severity findings.
 
 ## Milestone 2: predictable storage at scale (P2)
 
 - Replace all-in-memory full compaction with a streaming k-way merge and bounded
-  buffers. Run compaction in the storage worker/background executor with write
-  backpressure and crash-safe publication.
-- Move from an SSTable-count trigger to size-aware L0/tiered or leveled
-  compaction with explicit write-amplification and space-amplification targets.
-- Add a bounded block cache and file-handle cache; measure Bloom false-positive
-  rate, read amplification, cache hit rate, and p50/p95/p99 latency.
-- Make snapshots/transactions lazy or structurally shared so beginning a
-  transaction does not copy the whole visible database. Preserve retention
-  correctness with active snapshots before changing the representation.
-- Add prefix/range iteration primitives needed by backup and future API work.
+  buffers. Run compaction outside the request path with write backpressure and
+  crash-safe publication.
+- Move from an SSTable-count trigger to size-aware tiered or leveled compaction
+  with explicit write- and space-amplification targets.
+- Add bounded block and file-handle caches. Measure Bloom false-positive rate,
+  read amplification, cache hit rate, and p50/p95/p99 latency.
+- Make snapshots and transactions lazy or structurally shared so beginning a
+  transaction does not copy the whole visible database.
+- Add prefix/range iteration primitives needed by backup and future APIs.
 
 Acceptance: compaction peak memory is bounded independently of database size,
-foreground latency remains within a documented budget, and model-based tests
-still match a reference MVCC map across compaction/restart cycles.
+foreground latency remains within a documented budget, and model tests still
+match a reference MVCC map across compaction and restart cycles.
 
 ## Milestone 3: operations and observability (P2)
 
@@ -196,37 +161,33 @@ still match a reference MVCC map across compaction/restart cycles.
   request latency/status, queue depth, WAL/fsync latency, memtable bytes,
   SSTable count/bytes, compaction, recovery, and corruption.
 - Add `kvdb verify`, consistent backup/export, restore/import, and explicit
-  offline repair/salvage tooling. Never make automatic repair silently discard
+  offline repair/salvage tooling. Automatic repair must never silently discard
   data.
-- Add typed configuration with precedence (CLI, environment, defaults), startup
+- Add typed configuration with CLI/environment/default precedence, startup
   validation, and a redacted effective-configuration log.
-- Document capacity planning, upgrade/format migration, backup recovery,
-  disk-full response, corruption response, and graceful shutdown runbooks.
+- Document capacity planning, format migration, backup recovery, disk-full and
+  corruption response, and graceful shutdown runbooks.
 
 Acceptance: a fresh operator can detect an unhealthy store, create and restore
-a verified backup, and follow a tested runbook for disk-full and corruption.
+a verified backup, and follow tested disk-full and corruption runbooks.
 
-## Test strategy that spans all milestones
+## Cross-cutting test strategy
 
-- Add failpoints around WAL write/sync, SSTable sync/rename, manifest
-  sync/rename, WAL truncation, and old-table deletion; kill a child process at
-  each point and compare recovery with an acknowledged-operation journal.
 - Add property/model tests for batches, MVCC, retention, snapshots, transaction
   conflicts, and arbitrary reopen/flush/compact sequences.
-- Fuzz every WAL/SSTable/manifest decoder with allocation limits; run Miri on
-  focused codec/state-machine tests where practical.
+- Fuzz every WAL/SSTable/manifest decoder under allocation limits; run Miri on
+  focused codec and state-machine tests where practical.
 - Add real TCP server/client tests, multi-process lock tests, slow/disk-full I/O
-  tests, and platform coverage for Linux plus any explicitly supported targets.
-- Keep load tests correctness-only. Move statistical performance work to a
-  benchmark harness that reports distributions, warmup, dataset shape, and
-  storage durability mode.
+  tests, and platform coverage for every explicitly supported target.
+- Keep benchmark reports explicit about warmup, dataset shape, durability mode,
+  and latency distributions.
 
 ## Feature work after hardening (P3)
 
-Once Milestones 0-2 are complete, prioritize features that build on the proven
-single-node engine: range/prefix scans, conditional writes, network batch APIs,
-online backup, and optional TTL with explicitly defined MVCC semantics.
+After Milestones 0-2, prioritize features that build on the proven single-node
+engine: range/prefix scans, conditional writes, network batch APIs, online
+backup, and optional TTL with explicitly defined MVCC semantics.
 
-Replication, clustering, distributed transactions, and automatic sharding are
-deliberately out of scope until single-node durability, bounded recovery,
-backpressure, and operational recovery are demonstrated.
+Replication, clustering, distributed transactions, and automatic sharding stay
+out of scope until single-node durability, bounded recovery, backpressure, and
+operational recovery are demonstrated.
