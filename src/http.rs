@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -27,7 +27,7 @@ use axum_extra::headers::{Authorization, authorization::Basic};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::log_error;
-use crate::store::{Durability, Store, WriteBatch};
+use crate::store::{Durability, Store, WalCommitMetrics, WriteBatch};
 
 const TARGET: &str = "kvdb::http";
 const DEFAULT_QUEUE_CAPACITY: usize = 1_024;
@@ -84,6 +84,14 @@ pub struct StorageMetrics {
     pub logical_writes: u64,
     pub max_group_size: usize,
     pub queue_full: u64,
+    pub dequeued_commands: u64,
+    pub queue_wait_micros: u64,
+    pub max_queue_wait_micros: u64,
+    pub group_commit_micros: u64,
+    pub max_group_commit_micros: u64,
+    pub wal_write_micros: u64,
+    pub wal_flush_micros: u64,
+    pub wal_sync_micros: u64,
 }
 
 #[derive(Default)]
@@ -92,6 +100,14 @@ struct StorageMetricsInner {
     logical_writes: AtomicU64,
     max_group_size: AtomicUsize,
     queue_full: AtomicU64,
+    dequeued_commands: AtomicU64,
+    queue_wait_micros: AtomicU64,
+    max_queue_wait_micros: AtomicU64,
+    group_commit_micros: AtomicU64,
+    max_group_commit_micros: AtomicU64,
+    wal_write_micros: AtomicU64,
+    wal_flush_micros: AtomicU64,
+    wal_sync_micros: AtomicU64,
 }
 
 impl StorageMetricsInner {
@@ -101,6 +117,14 @@ impl StorageMetricsInner {
             logical_writes: self.logical_writes.load(Ordering::Relaxed),
             max_group_size: self.max_group_size.load(Ordering::Relaxed),
             queue_full: self.queue_full.load(Ordering::Relaxed),
+            dequeued_commands: self.dequeued_commands.load(Ordering::Relaxed),
+            queue_wait_micros: self.queue_wait_micros.load(Ordering::Relaxed),
+            max_queue_wait_micros: self.max_queue_wait_micros.load(Ordering::Relaxed),
+            group_commit_micros: self.group_commit_micros.load(Ordering::Relaxed),
+            max_group_commit_micros: self.max_group_commit_micros.load(Ordering::Relaxed),
+            wal_write_micros: self.wal_write_micros.load(Ordering::Relaxed),
+            wal_flush_micros: self.wal_flush_micros.load(Ordering::Relaxed),
+            wal_sync_micros: self.wal_sync_micros.load(Ordering::Relaxed),
         }
     }
 
@@ -109,6 +133,28 @@ impl StorageMetricsInner {
         self.logical_writes
             .fetch_add(size as u64, Ordering::Relaxed);
         self.max_group_size.fetch_max(size, Ordering::Relaxed);
+    }
+
+    fn record_queue_wait(&self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        self.dequeued_commands.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_micros.fetch_add(micros, Ordering::Relaxed);
+        self.max_queue_wait_micros
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn record_commit(&self, elapsed: Duration, wal: WalCommitMetrics) {
+        let micros = duration_micros(elapsed);
+        self.group_commit_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.max_group_commit_micros
+            .fetch_max(micros, Ordering::Relaxed);
+        self.wal_write_micros
+            .fetch_add(wal.write_micros, Ordering::Relaxed);
+        self.wal_flush_micros
+            .fetch_add(wal.flush_micros, Ordering::Relaxed);
+        self.wal_sync_micros
+            .fetch_add(wal.sync_micros, Ordering::Relaxed);
     }
 }
 
@@ -148,7 +194,7 @@ impl AppState {
 
 #[derive(Clone)]
 struct StorageHandle {
-    sender: mpsc::Sender<StorageCommand>,
+    sender: mpsc::Sender<QueuedStorageCommand>,
     metrics: Arc<StorageMetricsInner>,
 }
 
@@ -190,6 +236,10 @@ impl StorageHandle {
     }
 
     fn enqueue(&self, command: StorageCommand) -> Result<(), DispatchError> {
+        let command = QueuedStorageCommand {
+            enqueued_at: Instant::now(),
+            command,
+        };
         self.sender.try_send(command).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => {
                 self.metrics.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -198,6 +248,11 @@ impl StorageHandle {
             mpsc::error::TrySendError::Closed(_) => DispatchError::Closed,
         })
     }
+}
+
+struct QueuedStorageCommand {
+    enqueued_at: Instant,
+    command: StorageCommand,
 }
 
 enum StorageCommand {
@@ -236,7 +291,7 @@ enum DispatchError {
 
 fn storage_worker(
     mut store: Store,
-    mut receiver: mpsc::Receiver<StorageCommand>,
+    mut receiver: mpsc::Receiver<QueuedStorageCommand>,
     options: StorageOptions,
     metrics: Arc<StorageMetricsInner>,
 ) {
@@ -245,22 +300,25 @@ fn storage_worker(
         if let Err(error) = store.poll_background_compaction() {
             log_error!(TARGET, "background compaction publication failed: {error}");
         }
-        let command = match pending.take().or_else(|| receiver.blocking_recv()) {
+        let queued = match pending.take().or_else(|| receiver.blocking_recv()) {
             Some(command) => command,
             None => break,
         };
+        metrics.record_queue_wait(queued.enqueued_at.elapsed());
 
-        match command {
+        match queued.command {
             StorageCommand::Get { key, response } => {
                 let _ = response.send(store.get(&key));
             }
             StorageCommand::Write(first) => {
+                let started = Instant::now();
                 let mut group = vec![first];
                 drain_adjacent_writes(
                     &mut receiver,
                     &mut pending,
                     &mut group,
                     options.group_commit_max,
+                    &metrics,
                 );
                 if group.len() < options.group_commit_max
                     && pending.is_none()
@@ -273,28 +331,40 @@ fn storage_worker(
                         &mut pending,
                         &mut group,
                         options.group_commit_max,
+                        &metrics,
                     );
                 }
                 metrics.record_group(group.len());
-                process_write_group(&mut store, group);
+                if let Some(wal) = process_write_group(&mut store, group) {
+                    metrics.record_commit(started.elapsed(), wal);
+                }
             }
         }
     }
 }
 
 fn drain_adjacent_writes(
-    receiver: &mut mpsc::Receiver<StorageCommand>,
-    pending: &mut Option<StorageCommand>,
+    receiver: &mut mpsc::Receiver<QueuedStorageCommand>,
+    pending: &mut Option<QueuedStorageCommand>,
     group: &mut Vec<WriteCommand>,
     max_group_size: usize,
+    metrics: &StorageMetricsInner,
 ) {
     while group.len() < max_group_size {
         match receiver.try_recv() {
-            Ok(StorageCommand::Write(write)) => group.push(write),
-            Ok(command) => {
-                *pending = Some(command);
-                break;
-            }
+            Ok(queued) => match queued.command {
+                StorageCommand::Write(write) => {
+                    metrics.record_queue_wait(queued.enqueued_at.elapsed());
+                    group.push(write);
+                }
+                command => {
+                    *pending = Some(QueuedStorageCommand {
+                        enqueued_at: queued.enqueued_at,
+                        command,
+                    });
+                    break;
+                }
+            },
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                 break;
             }
@@ -302,7 +372,7 @@ fn drain_adjacent_writes(
     }
 }
 
-fn process_write_group(store: &mut Store, writes: Vec<WriteCommand>) {
+fn process_write_group(store: &mut Store, writes: Vec<WriteCommand>) -> Option<WalCommitMetrics> {
     let mut overlay = BTreeMap::<Vec<u8>, bool>::new();
     let mut delete_results = Vec::with_capacity(writes.len());
 
@@ -319,7 +389,7 @@ fn process_write_group(store: &mut Store, writes: Vec<WriteCommand>) {
                         Ok(value) => value.is_some(),
                         Err(error) => {
                             fail_commands(writes, &error);
-                            return;
+                            return None;
                         }
                     },
                 };
@@ -368,8 +438,12 @@ fn process_write_group(store: &mut Store, writes: Vec<WriteCommand>) {
                     }
                 }
             }
+            Some(store.last_wal_commit_metrics())
         }
-        Err(error) => fail_replies(replies, &error),
+        Err(error) => {
+            fail_replies(replies, &error);
+            None
+        }
     }
 }
 
@@ -518,6 +592,10 @@ fn positive_usize_env(name: &str) -> Option<usize> {
         .filter(|&value| value > 0)
 }
 
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -566,6 +644,9 @@ mod tests {
         assert_eq!(metrics.write_groups, 1);
         assert_eq!(metrics.logical_writes, 3);
         assert_eq!(metrics.max_group_size, 3);
+        assert_eq!(metrics.dequeued_commands, 4);
+        assert!(metrics.max_group_commit_micros > 0);
+        assert!(metrics.wal_sync_micros > 0);
 
         cleanup(storage, path).await;
     }

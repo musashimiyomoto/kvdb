@@ -652,14 +652,26 @@ async fn tcp_sample(
     server.abort();
     let _ = server.await;
 
-    if write {
-        let metrics = state.storage_metrics();
-        println!(
-            "GROUP_COMMIT durability={durability:?} concurrency={concurrency} \
-             requests={requests} groups={} max_group_size={} queue_full={}",
-            metrics.write_groups, metrics.max_group_size, metrics.queue_full
-        );
-    }
+    let metrics = state.storage_metrics();
+    let operation = if write { "PUT" } else { "GET" };
+    println!(
+        "STORAGE_WORKER operation={operation} durability={durability:?} \
+         concurrency={concurrency} requests={requests} dequeued={} groups={} \
+         max_group_size={} queue_full={} queue_wait_us={} max_queue_wait_us={} \
+         group_commit_us={} max_group_commit_us={} wal_write_us={} wal_flush_us={} \
+         wal_sync_us={}",
+        metrics.dequeued_commands,
+        metrics.write_groups,
+        metrics.max_group_size,
+        metrics.queue_full,
+        metrics.queue_wait_micros,
+        metrics.max_queue_wait_micros,
+        metrics.group_commit_micros,
+        metrics.max_group_commit_micros,
+        metrics.wal_write_micros,
+        metrics.wal_flush_micros,
+        metrics.wal_sync_micros
+    );
 
     if !keep {
         fs::remove_dir_all(&dir).expect("remove TCP benchmark sample directory");
@@ -745,12 +757,30 @@ fn filesystem_type(path: &Path) -> String {
 }
 
 fn command_version(program: &str, argument: &str) -> String {
+    command_output(program, &[argument])
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> String {
     Command::new(program)
-        .arg(argument)
+        .args(arguments)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn cpu_model() -> String {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("model name\t:")
+                    .or_else(|| line.strip_prefix("Model\t\t:"))
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -775,11 +805,16 @@ fn main() {
 
     let workload = config.profile.workload();
     println!(
-        "BENCH_ENV profile={} path={} filesystem={} rust={:?} value_bytes={} samples={}",
+        "BENCH_ENV profile={} path={} filesystem={} rust={:?} git={} os={:?} cpu={:?} \
+         logical_cpus={} value_bytes={} samples={}",
         config.profile.name(),
         run.path.display(),
         filesystem,
         command_version("rustc", "--version"),
+        command_output("git", &["rev-parse", "HEAD"]),
+        command_output("uname", &["-srmo"]),
+        cpu_model(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         VALUE_BYTES,
         workload.samples
     );

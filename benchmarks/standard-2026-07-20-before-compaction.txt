@@ -1,0 +1,101 @@
+warning: constant `BATCH_SIZE` is never used
+  --> benches/kvdb_bench.rs:22:7
+   |
+22 | const BATCH_SIZE: usize = 100;
+   |       ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: multiple fields are never read
+   --> benches/kvdb_bench.rs:131:5
+    |
+129 | struct Workload {
+    |        -------- fields in this struct
+130 |     samples: usize,
+131 |     durable_writes: usize,
+    |     ^^^^^^^^^^^^^^
+132 |     durable_batch_records: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^
+133 |     durable_tcp_writes: usize,
+    |     ^^^^^^^^^^^^^^^^^^
+134 |     buffered_writes: usize,
+    |     ^^^^^^^^^^^^^^^
+135 |     read_keys: usize,
+    |     ^^^^^^^^^
+136 |     read_ops: usize,
+    |     ^^^^^^^^
+137 |     tcp_ops: usize,
+    |     ^^^^^^^
+    |
+    = note: `Workload` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `bench_writes` is never used
+   --> benches/kvdb_bench.rs:308:4
+    |
+308 | fn bench_writes(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^^
+
+warning: function `bench_reads` is never used
+   --> benches/kvdb_bench.rs:361:4
+    |
+361 | fn bench_reads(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^
+
+warning: function `bench_recovery` is never used
+   --> benches/kvdb_bench.rs:419:4
+    |
+419 | fn bench_recovery(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `bench_tcp` is never used
+   --> benches/kvdb_bench.rs:471:4
+    |
+471 | fn bench_tcp(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^
+
+warning: function `tcp_sample` is never used
+   --> benches/kvdb_bench.rs:531:10
+    |
+531 | async fn tcp_sample(
+    |          ^^^^^^^^^^
+
+warning: function `warm_http_connections` is never used
+   --> benches/kvdb_bench.rs:635:10
+    |
+635 | async fn warm_http_connections(
+    |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `mixed_index` is never used
+   --> benches/kvdb_bench.rs:658:4
+    |
+658 | fn mixed_index(index: usize, upper_bound: usize) -> usize {
+    |    ^^^^^^^^^^^
+
+warning: struct `XorShift64` is never constructed
+   --> benches/kvdb_bench.rs:665:8
+    |
+665 | struct XorShift64(u64);
+    |        ^^^^^^^^^^
+
+warning: associated items `new` and `next_usize` are never used
+   --> benches/kvdb_bench.rs:668:8
+    |
+667 | impl XorShift64 {
+    | --------------- associated items in this implementation
+668 |     fn new(seed: u64) -> Self {
+    |        ^^^
+...
+672 |     fn next_usize(&mut self, upper_bound: usize) -> usize {
+    |        ^^^^^^^^^^
+
+warning: `kvdb` (bench "kvdb_bench") generated 11 warnings
+    Finished `bench` profile [optimized] target(s) in 0.18s
+     Running benches/kvdb_bench.rs (target/release/deps/kvdb_bench-98b2df1aca08503b)
+BENCH_ENV profile=standard path=/home/kioharu6174/kvdb/target/baseline-compaction-63c851b/run-88306-1784550886681745977 filesystem=ext2/ext3 rust="rustc 1.96.0 (ac68faa20 2026-05-25)" value_bytes=128 samples=5
+BENCH_NOTE SSTable and recovery reads use a warm OS page cache; SSTable point reads report explicit application-cache enabled/disabled scenarios; shared-runner results are informational, not an SLA
+STORAGE name="compaction_overlapping" sample=0 before_bytes=50063098 after_bytes=43593873
+STORAGE name="compaction_overlapping" sample=1 before_bytes=50063098 after_bytes=43593873
+STORAGE name="compaction_overlapping" sample=2 before_bytes=50063098 after_bytes=43593873
+STORAGE name="compaction_overlapping" sample=3 before_bytes=50063098 after_bytes=43593873
+STORAGE name="compaction_overlapping" sample=4 before_bytes=50063098 after_bytes=43593873
+RESULT name="compaction_overlapping" throughput_unit=input_versions latency_unit=compaction samples=5 median_per_sec=92551 min_per_sec=81620 max_per_sec=148723 p50_us=3241459.706 p95_us=3675573.408 p99_us=3675573.408 max_us=3675573.408

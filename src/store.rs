@@ -67,6 +67,13 @@ pub struct CompactionMetrics {
     pub foreground_stalls: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalCommitMetrics {
+    pub write_micros: u64,
+    pub flush_micros: u64,
+    pub sync_micros: u64,
+}
+
 struct BackgroundCompaction {
     target_names: Vec<String>,
     handle: JoinHandle<io::Result<CompactionBuild>>,
@@ -283,6 +290,7 @@ pub struct Store {
     compaction_threshold: Option<usize>,
     background_compaction: Option<BackgroundCompaction>,
     compaction_metrics: CompactionMetrics,
+    last_wal_commit_metrics: WalCommitMetrics,
     durability: Durability,
     /// An uncertain storage write makes this instance permanently read-only.
     poisoned: bool,
@@ -368,6 +376,7 @@ impl Store {
             compaction_threshold: compaction_threshold_from_env(),
             background_compaction: None,
             compaction_metrics: CompactionMetrics::default(),
+            last_wal_commit_metrics: WalCommitMetrics::default(),
             durability: durability_from_env(),
             poisoned: false,
         })
@@ -583,14 +592,30 @@ impl Store {
         &mut self,
         write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
     ) -> io::Result<()> {
-        let result = write(&mut self.wal).and_then(|()| {
+        let result = (|| {
+            let write_started = Instant::now();
+            write(&mut self.wal)?;
+            let write_micros = duration_micros(write_started.elapsed());
+
+            let flush_started = Instant::now();
             self.wal.flush()?;
-            if self.durability == Durability::Durable {
+            let flush_micros = duration_micros(flush_started.elapsed());
+
+            let sync_micros = if self.durability == Durability::Durable {
+                let sync_started = Instant::now();
                 self.wal.get_ref().sync_data()?;
-            }
+                duration_micros(sync_started.elapsed())
+            } else {
+                0
+            };
             self.wal_bytes = self.wal.get_ref().metadata()?.len();
+            self.last_wal_commit_metrics = WalCommitMetrics {
+                write_micros,
+                flush_micros,
+                sync_micros,
+            };
             Ok(())
-        });
+        })();
         if result.is_err() {
             self.poisoned = true;
         }
@@ -1128,6 +1153,10 @@ impl Store {
         self.compaction_metrics
     }
 
+    pub(crate) fn last_wal_commit_metrics(&self) -> WalCommitMetrics {
+        self.last_wal_commit_metrics
+    }
+
     /// Sequence number of the latest committed mutation or atomic batch.
     pub fn current_sequence(&self) -> u64 {
         self.sequence
@@ -1452,6 +1481,10 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn duration_micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn lock_path(wal_path: &Path) -> PathBuf {

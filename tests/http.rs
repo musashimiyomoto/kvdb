@@ -147,8 +147,11 @@ async fn concurrent_puts_share_group_commits() {
 
     let metrics = state.storage_metrics();
     assert_eq!(metrics.logical_writes, 32);
+    assert_eq!(metrics.dequeued_commands, 32);
     assert!(metrics.max_group_size > 1);
     assert!(metrics.write_groups < metrics.logical_writes);
+    assert!(metrics.max_group_commit_micros > 0);
+    assert!(metrics.wal_sync_micros > 0);
 
     drop(state);
     std::fs::remove_file(path.with_extension("wal.lock")).ok();

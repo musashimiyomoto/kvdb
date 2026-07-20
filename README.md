@@ -131,8 +131,10 @@ latency. `--allow-memory-fs` is available only for an explicitly CPU-only run.
 Every result reports median throughput across independent samples plus
 p50/p95/p99/max latency. Library-operation latency is sampled to limit timer
 overhead; every TCP request is timed. The output records the profile, path,
-filesystem, Rust version, value size, throughput unit, and latency unit so a
-batch-commit latency cannot be mistaken for per-record latency.
+filesystem, Git revision, Rust/kernel/CPU metadata, value size, throughput unit,
+and latency unit so a batch-commit latency cannot be mistaken for per-record
+latency. The retained controlled before/after report and raw captures live in
+[`benchmarks/`](benchmarks/README.md).
 
 SSTable and recovery scenarios are deliberately labeled `warm`: portable cache
 eviction cannot be guaranteed without privileged, platform-specific support.
@@ -190,6 +192,11 @@ The HTTP storage worker has separate backpressure and group-commit controls:
 | `KVDB_STORAGE_QUEUE_CAPACITY` | 1024 | queued storage commands before HTTP returns `503` |
 | `KVDB_GROUP_COMMIT_MAX` | 64 | maximum adjacent writes sharing one WAL flush/fsync |
 | `KVDB_GROUP_COMMIT_DELAY_US` | 1000 | durable-write collection window in microseconds |
+
+`AppState::storage_metrics()` reports group counts and sizes, overloads,
+dequeued commands, total/maximum queue wait and group-commit time, plus WAL
+encode/write, flush, and fsync time. These cumulative counters let benchmark
+output attribute request latency to queueing versus storage work.
 
 After a successful flush, the manifest is updated and the WAL is truncated.
 Each SSTable key record contains its versions in ascending commit-sequence

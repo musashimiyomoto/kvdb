@@ -1,0 +1,61 @@
+   Compiling kvdb v0.1.0 (/tmp/kvdb-before-worker-d008983)
+warning: constant `BATCH_SIZE` is never used
+  --> benches/kvdb_bench.rs:22:7
+   |
+22 | const BATCH_SIZE: usize = 100;
+   |       ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `buffered_writes`, `compaction_keys`, and `compaction_tables` are never read
+   --> benches/kvdb_bench.rs:126:5
+    |
+123 | struct Workload {
+    |        -------- fields in this struct
+...
+126 |     buffered_writes: usize,
+    |     ^^^^^^^^^^^^^^^
+...
+130 |     compaction_keys: usize,
+    |     ^^^^^^^^^^^^^^^
+131 |     compaction_tables: usize,
+    |     ^^^^^^^^^^^^^^^^^
+    |
+    = note: `Workload` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `bench_writes` is never used
+   --> benches/kvdb_bench.rs:300:4
+    |
+300 | fn bench_writes(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^^
+
+warning: function `bench_recovery` is never used
+   --> benches/kvdb_bench.rs:386:4
+    |
+386 | fn bench_recovery(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `bench_compaction` is never used
+   --> benches/kvdb_bench.rs:413:4
+    |
+413 | fn bench_compaction(run: &RunDirectory, workload: Workload) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `directory_bytes` is never used
+   --> benches/kvdb_bench.rs:625:4
+    |
+625 | fn directory_bytes(path: &Path) -> u64 {
+    |    ^^^^^^^^^^^^^^^
+
+warning: `kvdb` (bench "kvdb_bench") generated 6 warnings
+    Finished `bench` profile [optimized] target(s) in 10.95s
+     Running benches/kvdb_bench.rs (target/release/deps/kvdb_bench-98b2df1aca08503b)
+BENCH_ENV profile=standard path=/home/kioharu6174/kvdb/target/baseline-worker-d008983/run-93903-1784551322491013601 filesystem=ext2/ext3 rust="rustc 1.96.0 (ac68faa20 2026-05-25)" value_bytes=128 samples=5
+BENCH_NOTE SSTable and recovery reads are warm-cache measurements; shared-runner results are informational, not an SLA
+RESULT name="get_memtable_random" throughput_unit=reads latency_unit=read samples=5 median_per_sec=519188 min_per_sec=355259 max_per_sec=546660 p50_us=1.500 p95_us=3.400 p99_us=10.000 max_us=220.300
+RESULT name="get_sstable_warm_random" throughput_unit=reads latency_unit=read samples=5 median_per_sec=48306 min_per_sec=43551 max_per_sec=49319 p50_us=15.100 p95_us=42.700 p99_us=102.600 max_us=6889.104
+RESULT name="tcp_get_c1" throughput_unit=requests latency_unit=request samples=5 median_per_sec=9858 min_per_sec=9005 max_per_sec=9949 p50_us=69.700 p95_us=203.100 p99_us=511.700 max_us=10576.802
+RESULT name="tcp_get_c8" throughput_unit=requests latency_unit=request samples=5 median_per_sec=18931 min_per_sec=18670 max_per_sec=21532 p50_us=278.500 p95_us=987.800 p99_us=2655.100 max_us=15098.703
+RESULT name="tcp_get_c32" throughput_unit=requests latency_unit=request samples=5 median_per_sec=19324 min_per_sec=14761 max_per_sec=19889 p50_us=1332.000 p95_us=4084.501 p99_us=7500.601 max_us=46793.110
+RESULT name="tcp_put_durable_c1" throughput_unit=requests latency_unit=request samples=5 median_per_sec=7 min_per_sec=5 max_per_sec=11 p50_us=88331.608 p95_us=424431.146 p99_us=890816.097 max_us=1932001.165
+RESULT name="tcp_put_durable_c8" throughput_unit=requests latency_unit=request samples=5 median_per_sec=6 min_per_sec=5 max_per_sec=8 p50_us=896319.311 p95_us=2231615.989 p99_us=7260927.901 max_us=10870696.070

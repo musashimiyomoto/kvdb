@@ -3,10 +3,10 @@
 Last reviewed: 2026-07-20.
 
 kvdb has a working single-node LSM-style engine, baseline persistence
-hardening, and a reproducible end-to-end benchmark. The current goal is to
-finish the controlled standard-profile rebaseline for the implemented worker,
-cache, and background-compaction changes, and only then resume file-format
-hardening and API expansion.
+hardening, and a reproducible end-to-end benchmark. The controlled performance
+rebaseline is complete; the current goal is versioned checksummed storage
+formats and crash-point coverage while retaining the measured worker GET
+regression as explicit follow-up work.
 
 ## Verified baseline
 
@@ -82,6 +82,26 @@ buffer was `1,696 bytes` and no twice-threshold foreground stall occurred. This
 validates the harness and attribution counters, not the controlled comparison
 required by Milestone 0.4.
 
+### Controlled standard rebaseline
+
+Five-sample before/after runs on the same persistent WSL2 `ext2/ext3` volume,
+Rust 1.96.0, and i5-7200U are retained under `benchmarks/`. The full methodology,
+raw-output links, percentiles, and attribution counters are in
+[`benchmarks/standard-2026-07-20.md`](benchmarks/standard-2026-07-20.md).
+
+| Scenario | Before | After | Tail / attribution |
+|---|---:|---:|---|
+| Durable TCP PUT c8 | 6 req/s | 76 req/s | p99 7.26 s -> 587 ms; 200 writes / 25 fsync groups |
+| Durable TCP PUT c1 control | 7 req/s | 7 req/s | unchanged without overlapping writes |
+| Warm SSTable GET | 48.3k reads/s | 301k reads/s | p99 103 us -> 17 us; 99,437 hits / 1,563 misses |
+| Background compaction | blocking 3.24 s p50 | 3.53 s end-to-end p50 | 456k foreground GET/s, p99 55.8 us, 2,032-byte merge buffer |
+| TCP GET c1 | 9.86k req/s | 2.35k req/s | worker handoff regression; p99 512 us -> 2.29 ms |
+
+Group commit and caching improve their attributed bottlenecks. Background
+compaction bounds merge records and preserves foreground availability rather
+than reducing total work. The standard run also confirms that the worker read
+handoff remains costly, especially at low concurrency.
+
 The measurements identify three immediate bottlenecks:
 
 - Per-mutation fsync dominates durable writes; batching 100 records improves
@@ -99,7 +119,7 @@ it.
 1. [x] Add a bounded storage worker and group commit.
 2. [x] Add bounded SSTable file-handle and block caches.
 3. [x] Move bounded streaming compaction out of the request path.
-4. Run the standard benchmark on a controlled on-disk environment, finish
+4. [x] Run the standard benchmark on a controlled on-disk environment, finish
    detailed worker/cache instrumentation, and record
    the before/after baseline.
 5. Add versioned checksummed WAL/SSTable/manifest formats and crash failpoints.
@@ -131,14 +151,14 @@ SSTable or manifest fsyncs its parent directory on Unix.
 |---|---|---|---|
 | R2 | P0 | Partial | WAL records are not versioned, length-delimited frames and have no checksum or complete crash-point coverage. |
 | R7 | P0 | Partial | WAL records, SSTable blocks, and manifest metadata lack checksums and a documented migration path. |
-| R8 | P1 | Partial | A bounded worker and group commit replace the request-path mutex; queue/fsync timing, cancellation, and graceful worker shutdown remain. |
+| R8 | P1 | Partial | A bounded worker and group commit replace the request-path mutex; cancellation and graceful worker shutdown remain, and standard TCP GET throughput regresses 28-76% depending on concurrency. |
 | R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` although reqwest has no TLS. |
 | R10 | P1 | Open | One-shot client commands print HTTP errors but exit successfully, and values are decoded as text. |
 | R11 | P1 | Open | REST exposes UTF-8 path keys and an implicit body limit while the library accepts binary keys and larger values. |
 | R12 | P1 | Partial | Actions use mutable tags; dependency policy, scanning, SBOM, and image metadata remain open. |
-| R13 | P1 | Implemented | Automatic compaction uses a streaming k-way merge on a background thread, manifest-atomic prefix replacement, suffix-safe concurrent flushes, twice-threshold backpressure, and run metrics; controlled rebaseline remains. |
+| R13 | P1 | Implemented | Automatic compaction uses a streaming k-way merge on a background thread, manifest-atomic prefix replacement, suffix-safe concurrent flushes, twice-threshold backpressure, run metrics, and a retained controlled rebaseline. |
 | R14 | P2 | Open | There is no readiness probe, graceful shutdown, metrics, backup, verify, or repair command. |
-| R15 | P1 | Implemented | Positive lookups use bounded file/decode-block LRU caches with metrics and compaction invalidation; controlled standard rebaseline remains. |
+| R15 | P1 | Implemented | Positive lookups use bounded file/decode-block LRU caches with metrics and compaction invalidation; the standard profile confirms about 6.2x median throughput and 6x p99 improvement. |
 
 ## Milestone 0: benchmark-driven performance (active)
 
@@ -151,9 +171,10 @@ SSTable or manifest fsyncs its parent directory on Unix.
 - [x] Preserve a unique sequence per logical commit and atomic semantics for
   each existing `WriteBatch` while sharing one WAL flush and fsync.
 - [ ] Add request cancellation and graceful worker drain/join.
-- Measure queue wait, group size, WAL write, fsync, and end-to-end commit
-  latency. Group counts/sizes and saturation are covered; detailed timing,
-  partial failure, cancellation, and shutdown coverage remain.
+- [x] Measure queue wait, group size, WAL encode/write, flush, fsync, and
+  end-to-end group-commit latency. The benchmark records these counters beside
+  TCP throughput and latency; partial failure, cancellation, and shutdown
+  coverage remain.
 
 Acceptance: slow storage does not block unrelated Tokio work; queue memory is
 bounded; concurrent commits share fsync without weakening durability; and the
@@ -172,8 +193,8 @@ baseline.
 
 Acceptance: repeated warm point reads avoid `File::open` and block decoding;
 charged block memory stays within its configured limit. The quick profile shows
-the expected throughput and p95/p99 improvement; standard-profile confirmation
-remains in 0.4.
+the expected throughput and p95/p99 improvement; the standard profile confirms
+the effect with an explicit cache-disabled control.
 
 ### 0.3 Background streaming compaction
 
@@ -193,15 +214,15 @@ merge now buffers one record per input table (plus one merged key); the existing
 sparse output index and Bloom filter remain proportional to output key count.
 The end-to-end harness reports foreground GET latency and compaction bytes,
 versions, duration, peak merge buffers, and stalls. Controlled standard-profile
-numbers remain in 0.4.
+results are retained with the raw benchmark output.
 
 ### 0.4 Rebaseline
 
-- Run `standard` on a documented on-disk environment before and after each
+- [x] Run `standard` on a documented on-disk environment before and after each
   optimization, retaining raw output and machine/filesystem metadata.
-- Compare median throughput and p50/p95/p99/max rather than selecting the best
+- [x] Compare median throughput and p50/p95/p99/max rather than selecting the best
   run. Do not gate shared CI on timing.
-- Record group size/fsync count and cache hit rate beside operation throughput
+- [x] Record group size/fsync count and cache hit rate beside operation throughput
   so improvements can be attributed to the intended mechanism.
 
 Acceptance: the repository contains one reproducible controlled-runner baseline
