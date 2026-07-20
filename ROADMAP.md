@@ -4,9 +4,9 @@ Last reviewed: 2026-07-20.
 
 kvdb has a working single-node LSM-style engine, baseline persistence
 hardening, and a reproducible end-to-end benchmark. The current goal is to
-remove the bottlenecks demonstrated by that benchmark, establish a new
-standard-profile baseline, and only then resume file-format hardening and API
-expansion.
+finish the controlled standard-profile rebaseline for the implemented worker,
+cache, and background-compaction changes, and only then resume file-format
+hardening and API expansion.
 
 ## Verified baseline
 
@@ -15,7 +15,7 @@ checks pass on that toolchain:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
-- `cargo test --all --locked` (65 passing tests, 19 intentionally ignored)
+- `cargo test --all --locked` (66 passing tests, 19 intentionally ignored)
 
 The four ignored load tests, 15 component microbenchmarks, and the quick
 end-to-end benchmark profile run as separate release-mode CI jobs. The
@@ -73,6 +73,15 @@ cache changes between rows.
 That is about `18x` throughput and `20x` p99 improvement in this quick run.
 The controlled standard-profile result remains part of Milestone 0.4.
 
+The first background-compaction quick run (2026-07-20, same ext4-backed WSL
+volume, three samples) merged five overlapping tables / 50k input versions with
+a median measured merge duration of about `611 ms`. End-to-end start through
+manifest publication was about `1.14 s` median. Concurrent foreground GETs ran
+at about `297k reads/s` median with p99 about `61 us`; the reported peak merge
+buffer was `1,696 bytes` and no twice-threshold foreground stall occurred. This
+validates the harness and attribution counters, not the controlled comparison
+required by Milestone 0.4.
+
 The measurements identify three immediate bottlenecks:
 
 - Per-mutation fsync dominates durable writes; batching 100 records improves
@@ -89,7 +98,7 @@ it.
 
 1. [x] Add a bounded storage worker and group commit.
 2. [x] Add bounded SSTable file-handle and block caches.
-3. Move bounded streaming compaction out of the request path.
+3. [x] Move bounded streaming compaction out of the request path.
 4. Run the standard benchmark on a controlled on-disk environment, finish
    detailed worker/cache instrumentation, and record
    the before/after baseline.
@@ -127,7 +136,7 @@ SSTable or manifest fsyncs its parent directory on Unix.
 | R10 | P1 | Open | One-shot client commands print HTTP errors but exit successfully, and values are decoded as text. |
 | R11 | P1 | Open | REST exposes UTF-8 path keys and an implicit body limit while the library accepts binary keys and larger values. |
 | R12 | P1 | Partial | Actions use mutable tags; dependency policy, scanning, SBOM, and image metadata remain open. |
-| R13 | P1 | Open | Full compaction materializes all tables and runs inline; the 50k-version quick case takes ~0.8 s median. |
+| R13 | P1 | Implemented | Automatic compaction uses a streaming k-way merge on a background thread, manifest-atomic prefix replacement, suffix-safe concurrent flushes, twice-threshold backpressure, and run metrics; controlled rebaseline remains. |
 | R14 | P2 | Open | There is no readiness probe, graceful shutdown, metrics, backup, verify, or repair command. |
 | R15 | P1 | Implemented | Positive lookups use bounded file/decode-block LRU caches with metrics and compaction invalidation; controlled standard rebaseline remains. |
 
@@ -168,18 +177,23 @@ remains in 0.4.
 
 ### 0.3 Background streaming compaction
 
-- Replace all-memory full compaction with a streaming k-way merge and bounded
+- [x] Replace all-memory full compaction with a streaming k-way merge and bounded
   buffers.
-- Schedule compaction outside the foreground request operation with explicit
+- [x] Schedule compaction outside the foreground request operation with explicit
   write backpressure and crash-safe publication.
-- Report compaction input/output bytes, versions, duration, peak buffers, and
+- [x] Report compaction input/output bytes, versions, duration, peak buffers, and
   foreground stalls.
-- Preserve MVCC, retention anchors, tombstones, and snapshot correctness across
+- [x] Preserve MVCC, retention anchors, tombstones, and snapshot correctness across
   concurrent writes and process restart.
 
 Acceptance: compaction memory is bounded independently of database size; no
 request performs the full merge inline; overlapping-compaction tests preserve
-the reference model; and foreground latency is reported during compaction.
+the reference model; and foreground latency is reported during compaction. The
+merge now buffers one record per input table (plus one merged key); the existing
+sparse output index and Bloom filter remain proportional to output key count.
+The end-to-end harness reports foreground GET latency and compaction bytes,
+versions, duration, peak merge buffers, and stalls. Controlled standard-profile
+numbers remain in 0.4.
 
 ### 0.4 Rebaseline
 

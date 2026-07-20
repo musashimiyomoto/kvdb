@@ -447,6 +447,7 @@ fn bench_compaction(run: &RunDirectory, workload: Workload) {
     let all_keys = keys(workload.compaction_keys);
     let input_versions = workload.compaction_keys * workload.compaction_tables;
     let mut results = ResultSet::default();
+    let mut foreground_reads = ResultSet::default();
     for sample in 0..workload.samples {
         let dir = run.sample("compaction_overlapping", sample);
         let mut store = Store::open(dir.join("kvdb.wal")).expect("open compaction store");
@@ -456,16 +457,54 @@ fn bench_compaction(run: &RunDirectory, workload: Workload) {
             store.flush().expect("flush compaction input table");
         }
         let before = directory_bytes(&dir);
-        let measurement = measure(1, |_| store.compact().expect("benchmark compaction"));
+        let compaction_start = Instant::now();
+        assert!(
+            store
+                .compact_in_background()
+                .expect("start background compaction")
+        );
+        let foreground = measure(all_keys.len(), |index| {
+            black_box(
+                store
+                    .get(&all_keys[index])
+                    .expect("foreground GET during compaction"),
+            );
+        });
+        store
+            .wait_for_background_compaction()
+            .expect("publish background compaction");
+        let compaction_elapsed = compaction_start.elapsed();
+        let measurement = Measurement {
+            elapsed: compaction_elapsed,
+            latencies_ns: vec![duration_ns(compaction_elapsed)],
+        };
         let after = directory_bytes(&dir);
+        let metrics = store.compaction_metrics();
         println!(
-            "STORAGE name=\"compaction_overlapping\" sample={sample} before_bytes={before} after_bytes={after}"
+            "STORAGE name=\"compaction_overlapping\" sample={sample} before_bytes={before} \
+             after_bytes={after} input_tables={} input_bytes={} output_bytes={} \
+             input_versions={} output_versions={} duration_us={} peak_buffer_bytes={} \
+             foreground_stalls={}",
+            metrics.input_tables,
+            metrics.input_bytes,
+            metrics.output_bytes,
+            metrics.input_versions,
+            metrics.output_versions,
+            metrics.duration_micros,
+            metrics.peak_buffer_bytes,
+            metrics.foreground_stalls
         );
         drop(store);
         run.clean_sample(&dir);
         results.push(measurement, input_versions);
+        foreground_reads.push(foreground, all_keys.len());
     }
     results.report("compaction_overlapping", "input_versions", "compaction");
+    foreground_reads.report(
+        "get_during_background_compaction",
+        "reads",
+        "foreground_get",
+    );
 }
 
 fn bench_tcp(run: &RunDirectory, workload: Workload) {

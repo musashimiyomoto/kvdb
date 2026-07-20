@@ -20,9 +20,13 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::limits::{MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES};
-use crate::sstable::{SsTable, SsTableCache, SsTableCacheMetrics, Value, VersionedValue};
+use crate::sstable::{
+    SsTable, SsTableCache, SsTableCacheMetrics, SsTableIter, Value, VersionedValue,
+};
 use crate::{log_debug, log_info, log_warn};
 
 /// WAL operation codes.
@@ -40,6 +44,42 @@ const DEFAULT_COMPACTION_THRESHOLD: usize = 8;
 const TARGET: &str = "kvdb::store";
 
 type MemTable = BTreeMap<Vec<u8>, Vec<VersionedValue>>;
+
+struct LiveSsTable {
+    name: String,
+    table: SsTable,
+}
+
+/// Point-in-time status plus measurements from the latest completed compaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionMetrics {
+    pub runs_started: u64,
+    pub runs_completed: u64,
+    pub runs_failed: u64,
+    pub in_progress: bool,
+    pub input_tables: u64,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub input_versions: u64,
+    pub output_versions: u64,
+    pub duration_micros: u64,
+    pub peak_buffer_bytes: usize,
+    pub foreground_stalls: u64,
+}
+
+struct BackgroundCompaction {
+    target_names: Vec<String>,
+    handle: JoinHandle<io::Result<CompactionBuild>>,
+}
+
+struct CompactionBuild {
+    working_path: PathBuf,
+    write_stats: crate::sstable::SsTableWriteStats,
+    input_bytes: u64,
+    input_versions: u64,
+    peak_buffer_bytes: usize,
+    duration_micros: u64,
+}
 
 /// Controls when an acknowledged WAL mutation reaches stable storage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -217,7 +257,7 @@ pub struct Store {
     /// Path of the WAL; also the anchor for SSTable / manifest paths.
     wal_path: PathBuf,
     /// Live SSTables, oldest first. Reads scan this in reverse (newest first).
-    sstables: Vec<SsTable>,
+    sstables: Vec<LiveSsTable>,
     /// Shared bounded file-handle and decoded-block cache for live SSTables.
     sstable_cache: Arc<SsTableCache>,
     /// Sequence number for the next SSTable file.
@@ -241,6 +281,8 @@ pub struct Store {
     wal_bytes_limit: u64,
     /// Compact after reaching this many SSTables; `None` disables automation.
     compaction_threshold: Option<usize>,
+    background_compaction: Option<BackgroundCompaction>,
+    compaction_metrics: CompactionMetrics,
     durability: Durability,
     /// An uncertain storage write makes this instance permanently read-only.
     poisoned: bool,
@@ -279,8 +321,11 @@ impl Store {
         let sstable_cache = SsTableCache::from_env();
         let mut sstables = Vec::with_capacity(sstable_names.len());
         for name in &sstable_names {
-            let sst = SsTable::open_with_cache(&dir.join(name), Arc::clone(&sstable_cache))?;
-            sstables.push(sst);
+            let table = SsTable::open_with_cache(&dir.join(name), Arc::clone(&sstable_cache))?;
+            sstables.push(LiveSsTable {
+                name: name.clone(),
+                table,
+            });
         }
         let next_seq = next_seq_from(&sstable_names);
 
@@ -321,6 +366,8 @@ impl Store {
             memtable_versions_limit: memtable_versions_limit_from_env(),
             wal_bytes_limit: wal_bytes_limit_from_env(),
             compaction_threshold: compaction_threshold_from_env(),
+            background_compaction: None,
+            compaction_metrics: CompactionMetrics::default(),
             durability: durability_from_env(),
             poisoned: false,
         })
@@ -403,7 +450,7 @@ impl Store {
         }
         // Then SSTables, newest (last pushed) first.
         for sst in self.sstables.iter().rev() {
-            match sst.get_at(key, sequence) {
+            match sst.table.get_at(key, sequence) {
                 Ok(Some(v)) => return Ok(Some(v)),
                 Ok(None) => continue,
                 Err(e) => return Err(e),
@@ -414,6 +461,7 @@ impl Store {
 
     /// Inserts or overwrites `key` with `value`, durably. May trigger a flush.
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
+        self.poll_background_compaction()?;
         self.ensure_writable()?;
         validate_key(&key, io::ErrorKind::InvalidInput)?;
         validate_value(&value, io::ErrorKind::InvalidInput)?;
@@ -428,6 +476,7 @@ impl Store {
     /// existed beforehand (preserving the HTTP layer's 404 semantics). The
     /// delete is stored as a tombstone regardless. May trigger a flush.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+        self.poll_background_compaction()?;
         self.ensure_writable()?;
         validate_key(key, io::ErrorKind::InvalidInput)?;
         // Existed = there is a live value at some level right now.
@@ -446,6 +495,7 @@ impl Store {
     /// either the complete batch or none of it if the trailing record is torn.
     /// Operations are applied in order, so the last operation for a key wins.
     pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<u64> {
+        self.poll_background_compaction()?;
         self.ensure_writable()?;
         if batch.is_empty() {
             return Ok(self.sequence);
@@ -469,6 +519,7 @@ impl Store {
     /// bytes are written, and no memtable mutation is applied until the complete
     /// group has been flushed (and synced in [`Durability::Durable`] mode).
     pub fn write_group(&mut self, batches: Vec<WriteBatch>) -> io::Result<Vec<u64>> {
+        self.poll_background_compaction()?;
         self.ensure_writable()?;
         for batch in &batches {
             if !batch.is_empty() {
@@ -586,6 +637,7 @@ impl Store {
     ///
     /// A no-op on an empty memtable.
     pub fn flush(&mut self) -> io::Result<()> {
+        self.poll_background_compaction()?;
         self.ensure_writable()?;
         let result = self.flush_inner();
         if result.is_err() {
@@ -627,10 +679,10 @@ impl Store {
 
         // 4. Adopt the new table and reset the memtable.
         let flushed = self.memtable.len();
-        self.sstables.push(SsTable::open_with_cache(
-            &sst_path,
-            Arc::clone(&self.sstable_cache),
-        )?);
+        self.sstables.push(LiveSsTable {
+            name: name.clone(),
+            table: SsTable::open_with_cache(&sst_path, Arc::clone(&self.sstable_cache))?,
+        });
         self.next_seq += 1;
         self.memtable.clear();
         self.memtable_bytes = 0;
@@ -646,13 +698,192 @@ impl Store {
     }
 
     fn maybe_compact(&mut self) -> io::Result<()> {
-        if self
-            .compaction_threshold
-            .is_some_and(|threshold| self.sstables.len() >= threshold)
+        self.poll_background_compaction()?;
+        let Some(threshold) = self.compaction_threshold else {
+            return Ok(());
+        };
+
+        if self.background_compaction.is_some()
+            && self.sstables.len() >= threshold.saturating_mul(2)
         {
-            self.compact()?;
+            self.compaction_metrics.foreground_stalls =
+                self.compaction_metrics.foreground_stalls.saturating_add(1);
+            self.wait_for_background_compaction()?;
+        }
+        if self.background_compaction.is_none() && self.sstables.len() >= threshold {
+            self.spawn_background_compaction()?;
         }
         Ok(())
+    }
+
+    /// Starts a full streaming compaction without blocking for the merge.
+    /// Returns `false` when fewer than two tables are live or a run is pending.
+    pub fn compact_in_background(&mut self) -> io::Result<bool> {
+        self.poll_background_compaction()?;
+        self.ensure_writable()?;
+        if self.background_compaction.is_some() || self.sstables.len() < 2 {
+            return Ok(false);
+        }
+        self.spawn_background_compaction()?;
+        Ok(true)
+    }
+
+    fn spawn_background_compaction(&mut self) -> io::Result<()> {
+        if self.background_compaction.is_some() || self.sstables.len() < 2 {
+            return Ok(());
+        }
+        let target_names = self.sstable_names();
+        let dir = parent_dir(&self.wal_path);
+        let inputs = target_names
+            .iter()
+            .map(|name| (name.clone(), dir.join(name)))
+            .collect();
+        let working_path = compaction_work_path(&self.wal_path);
+        remove_if_exists(&working_path)?;
+        remove_if_exists(&crate::sstable::staging_path(&working_path))?;
+        let history_start = self.history_start;
+        let handle = std::thread::Builder::new()
+            .name("kvdb-compaction".to_string())
+            .spawn(move || build_compaction(inputs, working_path, history_start))?;
+        self.compaction_metrics.runs_started =
+            self.compaction_metrics.runs_started.saturating_add(1);
+        self.compaction_metrics.in_progress = true;
+        self.background_compaction = Some(BackgroundCompaction {
+            target_names,
+            handle,
+        });
+        Ok(())
+    }
+
+    /// Publishes a completed automatic compaction without waiting for one that
+    /// is still running. Returns whether a result was adopted.
+    pub(crate) fn poll_background_compaction(&mut self) -> io::Result<bool> {
+        if !self
+            .background_compaction
+            .as_ref()
+            .is_some_and(|job| job.handle.is_finished())
+        {
+            return Ok(false);
+        }
+        self.finish_background_compaction()
+    }
+
+    /// Waits for the current automatic compaction and crash-safely publishes it.
+    pub fn wait_for_background_compaction(&mut self) -> io::Result<bool> {
+        if self.background_compaction.is_none() {
+            return Ok(false);
+        }
+        self.finish_background_compaction()
+    }
+
+    fn finish_background_compaction(&mut self) -> io::Result<bool> {
+        let job = self
+            .background_compaction
+            .take()
+            .expect("background compaction exists");
+        let result = match job.handle.join() {
+            Ok(result) => result
+                .and_then(|build| self.publish_background_compaction(&job.target_names, build)),
+            Err(_) => Err(io::Error::other("background compaction thread panicked")),
+        };
+
+        self.compaction_metrics.in_progress = false;
+        match result {
+            Ok(build) => {
+                self.compaction_metrics.runs_completed =
+                    self.compaction_metrics.runs_completed.saturating_add(1);
+                self.compaction_metrics.input_tables = job.target_names.len() as u64;
+                self.compaction_metrics.input_bytes = build.input_bytes;
+                self.compaction_metrics.output_bytes = build.write_stats.bytes;
+                self.compaction_metrics.input_versions = build.input_versions;
+                self.compaction_metrics.output_versions = build.write_stats.versions;
+                self.compaction_metrics.peak_buffer_bytes = build.peak_buffer_bytes;
+                self.compaction_metrics.duration_micros = build.duration_micros;
+                Ok(true)
+            }
+            Err(error) => {
+                self.compaction_metrics.runs_failed =
+                    self.compaction_metrics.runs_failed.saturating_add(1);
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_background_compaction(
+        &mut self,
+        target_names: &[String],
+        mut build: CompactionBuild,
+    ) -> io::Result<CompactionBuild> {
+        if self.sstables.len() < target_names.len()
+            || self.sstables[..target_names.len()]
+                .iter()
+                .map(|table| &table.name)
+                .ne(target_names.iter())
+        {
+            return Err(io::Error::other(
+                "live SSTables changed while background compaction was running",
+            ));
+        }
+
+        let dir = parent_dir(&self.wal_path);
+        let replacement = if build.write_stats.records == 0 {
+            remove_if_exists(&build.working_path)?;
+            build.write_stats.bytes = 0;
+            None
+        } else {
+            let name = sstable_name(&self.wal_path, self.next_seq);
+            let path = dir.join(&name);
+            std::fs::rename(&build.working_path, &path)?;
+            sync_parent_directory(&path)?;
+            let table = SsTable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
+            Some(LiveSsTable { name, table })
+        };
+
+        let mut names = Vec::with_capacity(
+            usize::from(replacement.is_some()) + self.sstables.len() - target_names.len(),
+        );
+        if let Some(table) = &replacement {
+            names.push(table.name.clone());
+        }
+        names.extend(
+            self.sstables[target_names.len()..]
+                .iter()
+                .map(|table| table.name.clone()),
+        );
+        write_manifest(
+            &manifest_path(&self.wal_path),
+            self.durable_sequence,
+            self.history_start,
+            &names,
+        )?;
+
+        let wrote_replacement = replacement.is_some();
+        let suffix = self.sstables.split_off(target_names.len());
+        let retired = std::mem::replace(&mut self.sstables, replacement.into_iter().collect());
+        self.sstables.extend(suffix);
+        if wrote_replacement {
+            self.next_seq = self.next_seq.saturating_add(1);
+        }
+        for old in retired {
+            let old_path = dir.join(&old.name);
+            self.sstable_cache.invalidate(&old_path);
+            if let Err(error) = std::fs::remove_file(&old_path) {
+                log_warn!(
+                    TARGET,
+                    "could not remove superseded SSTable {}: {error}",
+                    old.name
+                );
+            }
+        }
+
+        log_info!(
+            TARGET,
+            "background-compacted {} SSTable(s); {} table(s) live",
+            target_names.len(),
+            self.sstables.len()
+        );
+        Ok(build)
     }
 
     /// Merges every live SSTable into one table, retaining all ordered versions
@@ -664,6 +895,7 @@ impl Store {
     /// remove superseded files. A crash before the manifest update leaves the
     /// old set live; a crash after it leaves harmless orphaned old files.
     pub fn compact(&mut self) -> io::Result<()> {
+        self.wait_for_background_compaction()?;
         self.ensure_writable()?;
         let result = self.compact_sstables(self.history_start);
         if result.is_err() {
@@ -681,6 +913,7 @@ impl Store {
     /// older tables it would otherwise need to shadow. The boundary is durable
     /// and can only move forward.
     pub fn compact_with_retention(&mut self, history_start: u64) -> io::Result<()> {
+        self.wait_for_background_compaction()?;
         self.ensure_writable()?;
         if history_start < self.history_start {
             return Err(io::Error::new(
@@ -698,6 +931,7 @@ impl Store {
         // GC covers the whole Store. Flushing first ensures old versions do not
         // remain in the WAL or memtable and reappear in a later SSTable.
         self.flush()?;
+        self.wait_for_background_compaction()?;
         let result = self.compact_sstables(history_start);
         if result.is_err() {
             self.poisoned = true;
@@ -719,29 +953,25 @@ impl Store {
             return Ok(());
         }
 
-        let merged = retain_history_from(merge_sstables(&self.sstables)?, history_start);
         let old_names = self.sstable_names();
         let dir = parent_dir(&self.wal_path);
         let manifest = manifest_path(&self.wal_path);
 
-        let replacement = if merged.is_empty() {
+        let name = sstable_name(&self.wal_path, self.next_seq);
+        let path = dir.join(&name);
+        let mut merged = StreamingMerge::new(&self.sstables, history_start)?;
+        let write_stats = SsTable::write_stream(&path, &mut merged)?;
+        let replacement = if write_stats.records == 0 {
+            std::fs::remove_file(&path)?;
             None
         } else {
-            let name = sstable_name(&self.wal_path, self.next_seq);
-            let path = dir.join(&name);
-            SsTable::write(
-                &path,
-                merged
-                    .iter()
-                    .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
-            )?;
             let table = SsTable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
-            Some((name, table))
+            Some(LiveSsTable { name, table })
         };
 
         let replacement_names: Vec<String> = replacement
             .as_ref()
-            .map(|(name, _)| vec![name.clone()])
+            .map(|table| vec![table.name.clone()])
             .unwrap_or_default();
         write_manifest(
             &manifest,
@@ -750,7 +980,7 @@ impl Store {
             &replacement_names,
         )?;
 
-        let replacement_name = replacement.as_ref().map(|(name, _)| name.as_str());
+        let replacement_name = replacement.as_ref().map(|table| table.name.as_str());
         for old_name in &old_names {
             if Some(old_name.as_str()) == replacement_name {
                 continue;
@@ -765,7 +995,7 @@ impl Store {
             }
         }
 
-        self.sstables = replacement.into_iter().map(|(_, table)| table).collect();
+        self.sstables = replacement.into_iter().collect();
         self.history_start = history_start;
         if !self.sstables.is_empty() {
             self.next_seq += 1;
@@ -794,14 +1024,10 @@ impl Store {
 
     /// The file names of the currently-live SSTables, oldest first.
     fn sstable_names(&self) -> Vec<String> {
-        (0..self.sstables.len())
-            .map(|i| sstable_name(&self.wal_path, self.first_seq() + i as u64))
+        self.sstables
+            .iter()
+            .map(|sstable| sstable.name.clone())
             .collect()
-    }
-
-    /// Sequence number of the oldest live SSTable (0 if there are none).
-    fn first_seq(&self) -> u64 {
-        self.next_seq - self.sstables.len() as u64
     }
 
     /// Number of live keys currently visible across every level.
@@ -814,7 +1040,7 @@ impl Store {
         let mut keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
-            keys.extend(sst.keys()?);
+            keys.extend(sst.table.keys()?);
         }
         let mut live = 0;
         for key in keys {
@@ -897,6 +1123,11 @@ impl Store {
         self.sstable_cache.metrics()
     }
 
+    /// Automatic compaction status and measurements from its latest run.
+    pub fn compaction_metrics(&self) -> CompactionMetrics {
+        self.compaction_metrics
+    }
+
     /// Sequence number of the latest committed mutation or atomic batch.
     pub fn current_sequence(&self) -> u64 {
         self.sequence
@@ -920,7 +1151,7 @@ impl Store {
         let mut keys = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
-            keys.extend(sst.keys()?);
+            keys.extend(sst.table.keys()?);
         }
 
         let mut values = BTreeMap::new();
@@ -998,7 +1229,7 @@ impl Store {
             .map(|version| version.sequence)
             .unwrap_or(0);
         for sstable in &self.sstables {
-            latest = latest.max(sstable.latest_sequence(key)?.unwrap_or(0));
+            latest = latest.max(sstable.table.latest_sequence(key)?.unwrap_or(0));
         }
         Ok(latest)
     }
@@ -1014,73 +1245,177 @@ impl Store {
     }
 }
 
-/// K-way merge sorted SSTables, oldest to newest. All unique commit sequences
-/// are retained; if a sequence is duplicated, the newest source wins.
-fn merge_sstables(sstables: &[SsTable]) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
-    let sources: Vec<Vec<(Vec<u8>, Vec<VersionedValue>)>> = sstables
-        .iter()
-        .map(SsTable::entries)
-        .collect::<io::Result<_>>()?;
-    let mut positions = vec![0usize; sources.len()];
-    let mut merged = Vec::new();
-
-    while let Some((_, key)) = sources
-        .iter()
-        .enumerate()
-        .filter_map(|(source, entries)| {
-            entries.get(positions[source]).map(|(key, _)| (source, key))
-        })
-        .min_by(|(_, left), (_, right)| left.cmp(right))
-    {
-        let key = key.clone();
-        let mut versions = BTreeMap::new();
-
-        for (source, entries) in sources.iter().enumerate() {
-            if entries
-                .get(positions[source])
-                .is_some_and(|(candidate, _)| candidate == &key)
-            {
-                for version in &entries[positions[source]].1 {
-                    versions.insert(version.sequence, version.value.clone());
-                }
-                positions[source] += 1;
-            }
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Some(job) = self.background_compaction.take() {
+            let working_path = compaction_work_path(&self.wal_path);
+            let _ = job.handle.join();
+            let _ = remove_if_exists(&working_path);
+            let _ = remove_if_exists(&crate::sstable::staging_path(&working_path));
         }
-
-        merged.push((
-            key,
-            versions
-                .into_iter()
-                .map(|(sequence, value)| VersionedValue { sequence, value })
-                .collect(),
-        ));
     }
-
-    Ok(merged)
 }
 
-/// Applies a global history boundary to fully merged key histories.
-fn retain_history_from(
-    entries: Vec<(Vec<u8>, Vec<VersionedValue>)>,
+/// K-way merge with one decoded record buffered per input table. Sources are
+/// ordered oldest to newest, so a duplicate sequence from a newer table wins.
+struct StreamingMerge {
+    sources: Vec<SsTableIter>,
+    heads: Vec<Option<(Vec<u8>, Vec<VersionedValue>)>>,
     history_start: u64,
-) -> Vec<(Vec<u8>, Vec<VersionedValue>)> {
-    entries
-        .into_iter()
-        .filter_map(|(key, versions)| {
-            let after_boundary =
-                versions.partition_point(|version| version.sequence <= history_start);
-            let keep_from = after_boundary.saturating_sub(1);
-            let mut retained = versions.into_iter().skip(keep_from).collect::<Vec<_>>();
+    input_versions: u64,
+    peak_buffer_bytes: usize,
+    failed: bool,
+}
 
-            if retained.first().is_some_and(|version| {
-                version.sequence <= history_start && version.value == Value::Tombstone
-            }) {
-                retained.remove(0);
+impl StreamingMerge {
+    fn new(sstables: &[LiveSsTable], history_start: u64) -> io::Result<Self> {
+        let mut sources = sstables
+            .iter()
+            .map(|sstable| sstable.table.iter())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut heads = Vec::with_capacity(sources.len());
+        for source in &mut sources {
+            heads.push(source.next().transpose()?);
+        }
+        let peak_buffer_bytes = heads
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|(key, versions)| entry_buffer_bytes(key, versions))
+            .sum();
+        Ok(Self {
+            sources,
+            heads,
+            history_start,
+            input_versions: 0,
+            peak_buffer_bytes,
+            failed: false,
+        })
+    }
+
+    fn next_merged(&mut self) -> io::Result<Option<(Vec<u8>, Vec<VersionedValue>)>> {
+        loop {
+            let Some(key) = self
+                .heads
+                .iter()
+                .filter_map(|head| head.as_ref().map(|(key, _)| key))
+                .min()
+                .cloned()
+            else {
+                return Ok(None);
+            };
+
+            let mut versions = BTreeMap::new();
+            for source in 0..self.sources.len() {
+                if self.heads[source]
+                    .as_ref()
+                    .is_some_and(|(candidate, _)| candidate == &key)
+                {
+                    let (_, source_versions) = self.heads[source]
+                        .take()
+                        .expect("matching merge head exists");
+                    self.input_versions = self
+                        .input_versions
+                        .saturating_add(source_versions.len() as u64);
+                    for version in source_versions {
+                        versions.insert(version.sequence, version.value);
+                    }
+                    self.heads[source] = self.sources[source].next().transpose()?;
+                }
             }
 
-            (!retained.is_empty()).then_some((key, retained))
-        })
-        .collect()
+            let versions: Vec<_> = versions
+                .into_iter()
+                .map(|(sequence, value)| VersionedValue { sequence, value })
+                .collect();
+            let buffered = self
+                .heads
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|(key, versions)| entry_buffer_bytes(key, versions))
+                .sum::<usize>()
+                .saturating_add(entry_buffer_bytes(&key, &versions));
+            self.peak_buffer_bytes = self.peak_buffer_bytes.max(buffered);
+            if let Some(retained) = retain_versions_from(versions, self.history_start) {
+                return Ok(Some((key, retained)));
+            }
+        }
+    }
+}
+
+fn entry_buffer_bytes(key: &[u8], versions: &[VersionedValue]) -> usize {
+    key.len()
+        .saturating_add(versions.iter().fold(0usize, |bytes, version| {
+            bytes
+                .saturating_add(size_of::<VersionedValue>())
+                .saturating_add(match &version.value {
+                    Value::Set(value) => value.len(),
+                    Value::Tombstone => 0,
+                })
+        }))
+}
+
+impl Iterator for StreamingMerge {
+    type Item = io::Result<(Vec<u8>, Vec<VersionedValue>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        match self.next_merged() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+/// Applies the global history boundary to one fully merged key history.
+fn retain_versions_from(
+    versions: Vec<VersionedValue>,
+    history_start: u64,
+) -> Option<Vec<VersionedValue>> {
+    let after_boundary = versions.partition_point(|version| version.sequence <= history_start);
+    let keep_from = after_boundary.saturating_sub(1);
+    let mut retained = versions.into_iter().skip(keep_from).collect::<Vec<_>>();
+
+    if retained.first().is_some_and(|version| {
+        version.sequence <= history_start && version.value == Value::Tombstone
+    }) {
+        retained.remove(0);
+    }
+
+    (!retained.is_empty()).then_some(retained)
+}
+
+fn build_compaction(
+    inputs: Vec<(String, PathBuf)>,
+    working_path: PathBuf,
+    history_start: u64,
+) -> io::Result<CompactionBuild> {
+    let started = Instant::now();
+    let input_bytes = inputs.iter().try_fold(0u64, |bytes, (_, path)| {
+        Ok::<_, io::Error>(bytes.saturating_add(std::fs::metadata(path)?.len()))
+    })?;
+    let mut tables = Vec::with_capacity(inputs.len());
+    for (name, path) in inputs {
+        tables.push(LiveSsTable {
+            name,
+            table: SsTable::open(&path)?,
+        });
+    }
+    let mut merged = StreamingMerge::new(&tables, history_start)?;
+    let write_stats = SsTable::write_stream(&working_path, &mut merged)?;
+    Ok(CompactionBuild {
+        working_path,
+        write_stats,
+        input_bytes,
+        input_versions: merged.input_versions,
+        peak_buffer_bytes: merged.peak_buffer_bytes,
+        duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    })
 }
 
 // ---- Paths -----------------------------------------------------------------
@@ -1105,6 +1440,18 @@ fn stem(wal_path: &Path) -> String {
 /// The manifest path, `<dir>/<stem>.manifest`.
 fn manifest_path(wal_path: &Path) -> PathBuf {
     parent_dir(wal_path).join(format!("{}.manifest", stem(wal_path)))
+}
+
+fn compaction_work_path(wal_path: &Path) -> PathBuf {
+    parent_dir(wal_path).join(format!(".{}.compacting.sst", stem(wal_path)))
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn lock_path(wal_path: &Path) -> PathBuf {

@@ -63,6 +63,13 @@ const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 type BlockEntries = Vec<(Vec<u8>, Vec<VersionedValue>)>;
 type SharedBlockEntries = Arc<BlockEntries>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SsTableWriteStats {
+    pub records: u64,
+    pub versions: u64,
+    pub bytes: u64,
+}
+
 /// A value stored for a key: either live bytes, or a tombstone marking a delete.
 ///
 /// This is the memtable's value type as well as the SSTable record payload, so
@@ -390,8 +397,8 @@ struct BloomFilter {
 }
 
 impl BloomFilter {
-    fn from_keys(keys: &[Vec<u8>]) -> Self {
-        let bit_count = keys
+    fn from_hashes(hashes: &[(u64, u64)]) -> Self {
+        let bit_count = hashes
             .len()
             .saturating_mul(BLOOM_BITS_PER_KEY)
             .max(64)
@@ -400,8 +407,8 @@ impl BloomFilter {
             bits: vec![0; bit_count / 8],
             hashes: BLOOM_HASHES,
         };
-        for key in keys {
-            filter.insert(key);
+        for &(h1, h2) in hashes {
+            filter.insert_hashes(h1, h2);
         }
         filter
     }
@@ -411,8 +418,11 @@ impl BloomFilter {
             .all(|bit| self.bits[bit / 8] & (1 << (bit % 8)) != 0)
     }
 
-    fn insert(&mut self, key: &[u8]) {
-        for bit in self.bit_positions(key).collect::<Vec<_>>() {
+    fn insert_hashes(&mut self, h1: u64, h2: u64) {
+        let bit_count = self.bits.len() * 8;
+        for bit in (0..self.hashes)
+            .map(|i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)) as usize % bit_count)
+        {
             self.bits[bit / 8] |= 1 << (bit % 8);
         }
     }
@@ -424,6 +434,13 @@ impl BloomFilter {
         (0..self.hashes)
             .map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)) as usize % bit_count)
     }
+}
+
+fn key_hashes(key: &[u8]) -> (u64, u64) {
+    (
+        hash(key, 0xcbf2_9ce4_8422_2325),
+        hash(key, 0x9e37_79b9_7f4a_7c15) | 1,
+    )
 }
 
 /// A handle to one on-disk SSTable and its resident sparse block index.
@@ -443,21 +460,38 @@ impl SsTable {
     where
         I: IntoIterator<Item = (&'a [u8], &'a [VersionedValue])>,
     {
+        Self::write_stream(
+            path,
+            entries
+                .into_iter()
+                .map(|(key, versions)| Ok((key.to_vec(), versions.to_vec()))),
+        )?;
+        Ok(())
+    }
+
+    /// Writes owned records as they are produced, retaining only sparse index
+    /// metadata and compact Bloom hashes rather than the complete table data.
+    pub(crate) fn write_stream<I>(path: &Path, entries: I) -> io::Result<SsTableWriteStats>
+    where
+        I: IntoIterator<Item = io::Result<(Vec<u8>, Vec<VersionedValue>)>>,
+    {
         let tmp = tmp_path(path);
         let file = File::create(&tmp)?;
         let mut w = BufWriter::new(file);
         w.write_all(FILE_MAGIC)?;
 
         let mut blocks = Vec::<BlockIndex>::new();
-        let mut bloom_keys = Vec::new();
+        let mut bloom_hashes = Vec::new();
         let mut previous_key: Option<Vec<u8>> = None;
         let mut offset = FILE_MAGIC.len() as u64;
         let mut record_count = 0usize;
+        let mut version_count = 0u64;
 
-        for (key, versions) in entries {
+        for entry in entries {
+            let (key, versions) = entry?;
             if previous_key
                 .as_deref()
-                .is_some_and(|previous| previous >= key)
+                .is_some_and(|previous| previous >= key.as_slice())
             {
                 return Err(invalid_input(
                     "SSTable entries must have unique keys in ascending order",
@@ -468,21 +502,22 @@ impl SsTable {
                     previous.end = offset;
                 }
                 blocks.push(BlockIndex {
-                    first_key: key.to_vec(),
+                    first_key: key.clone(),
                     start: offset,
                     end: 0,
                     records: 0,
                 });
             }
 
-            write_record(&mut w, key, versions)?;
+            write_record(&mut w, &key, &versions)?;
             offset = offset
-                .checked_add(encoded_record_len(key, versions)?)
+                .checked_add(encoded_record_len(&key, &versions)?)
                 .ok_or_else(|| invalid_input("SSTable is too large"))?;
             blocks.last_mut().expect("a block was just created").records += 1;
             record_count += 1;
-            bloom_keys.push(key.to_vec());
-            previous_key = Some(key.to_vec());
+            version_count = version_count.saturating_add(versions.len() as u64);
+            bloom_hashes.push(key_hashes(&key));
+            previous_key = Some(key);
         }
 
         let index_offset = offset;
@@ -493,7 +528,7 @@ impl SsTable {
             &mut w,
             &blocks,
             record_count,
-            &BloomFilter::from_keys(&bloom_keys),
+            &BloomFilter::from_hashes(&bloom_hashes),
         )?;
         w.write_all(&index_offset.to_be_bytes())?;
         w.write_all(FOOTER_MAGIC)?;
@@ -501,7 +536,11 @@ impl SsTable {
         w.get_ref().sync_all()?;
         std::fs::rename(&tmp, path)?;
         sync_parent_directory(path)?;
-        Ok(())
+        Ok(SsTableWriteStats {
+            records: record_count as u64,
+            versions: version_count,
+            bytes: std::fs::metadata(path)?.len(),
+        })
     }
 
     /// Opens an existing table and loads its sparse index and Bloom filter.
@@ -602,6 +641,15 @@ impl SsTable {
         Ok(entries)
     }
 
+    /// Streams records in key order with at most one decoded record resident.
+    pub(crate) fn iter(&self) -> io::Result<SsTableIter> {
+        SsTableIter::open(
+            &self.path,
+            self.len,
+            self.blocks.last().map(|block| block.end),
+        )
+    }
+
     /// Reads every key in ascending order. This is intentionally a disk scan:
     /// callers that need the full key set must not force a dense resident index.
     pub fn keys(&self) -> io::Result<Vec<Vec<u8>>> {
@@ -616,6 +664,80 @@ impl SsTable {
     /// Whether the table holds no records.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+pub(crate) struct SsTableIter {
+    reader: BufReader<File>,
+    remaining: usize,
+    data_end: u64,
+    previous_key: Option<Vec<u8>>,
+    failed: bool,
+}
+
+impl SsTableIter {
+    fn open(path: &Path, records: usize, data_end: Option<u64>) -> io::Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; FILE_MAGIC.len()];
+        reader.read_exact(&mut magic)?;
+        if &magic != FILE_MAGIC {
+            return Err(invalid_data("invalid SSTable file magic"));
+        }
+        Ok(Self {
+            reader,
+            remaining: records,
+            data_end: data_end.unwrap_or(FILE_MAGIC.len() as u64),
+            previous_key: None,
+            failed: false,
+        })
+    }
+
+    fn next_record(&mut self) -> io::Result<Option<(Vec<u8>, Vec<VersionedValue>)>> {
+        if self.remaining == 0 {
+            if self.reader.stream_position()? != self.data_end {
+                return Err(invalid_data("SSTable record count does not match index"));
+            }
+            return Ok(None);
+        }
+
+        let Some((key, versions)) = read_record(&mut self.reader)? else {
+            return Err(invalid_data(
+                "SSTable ended before its indexed record count",
+            ));
+        };
+        if self
+            .previous_key
+            .as_deref()
+            .is_some_and(|previous| previous >= key.as_slice())
+        {
+            return Err(invalid_data("SSTable keys are not strictly ordered"));
+        }
+        self.remaining -= 1;
+        if self.reader.stream_position()? > self.data_end
+            || (self.remaining == 0 && self.reader.stream_position()? != self.data_end)
+        {
+            return Err(invalid_data("SSTable record data exceeds indexed bounds"));
+        }
+        self.previous_key = Some(key.clone());
+        Ok(Some((key, versions)))
+    }
+}
+
+impl Iterator for SsTableIter {
+    type Item = io::Result<(Vec<u8>, Vec<VersionedValue>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        match self.next_record() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
+        }
     }
 }
 
@@ -875,6 +997,10 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
     PathBuf::from(s)
+}
+
+pub(crate) fn staging_path(path: &Path) -> PathBuf {
+    tmp_path(path)
 }
 
 #[cfg(unix)]

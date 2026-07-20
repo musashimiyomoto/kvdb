@@ -179,7 +179,7 @@ The memtable is flushed when the first configured limit is reached:
 | `KVDB_MEMTABLE_BYTES_LIMIT` | 64 MiB | approximate memtable payload bytes |
 | `KVDB_MEMTABLE_VERSIONS_LIMIT` | 16384 | retained memtable versions |
 | `KVDB_WAL_BYTES_LIMIT` | 128 MiB | WAL file size |
-| `KVDB_COMPACTION_THRESHOLD` | 8 | SSTable count; `0` disables automatic compaction |
+| `KVDB_COMPACTION_THRESHOLD` | 8 | SSTable count that starts background compaction; `0` disables |
 | `KVDB_SSTABLE_FILE_CACHE_CAPACITY` | 64 | open SSTable file handles; `0` disables |
 | `KVDB_SSTABLE_BLOCK_CACHE_BYTES` | 64 MiB | decoded block payload budget; `0` disables |
 
@@ -203,11 +203,18 @@ deleting their files; hit/miss/eviction/residency counters are available from
 `Store::sstable_cache_metrics()`.
 
 Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the Store
-automatically performs a full compaction: it deduplicates identical commit
-sequences, preserves historical values and tombstones for MVCC, and atomically
-replaces the manifest. Setting the threshold to `0` disables automation;
-`Store::compact()` remains available for an explicit run. Automatic and
-ordinary manual compaction preserve every currently retained version.
+starts a streaming compaction thread. The k-way merge buffers one decoded
+record per input table instead of materializing every table, deduplicates commit
+sequences, and preserves historical values and tombstones for MVCC. Foreground
+writes and flushes continue; tables created during the merge remain newer
+suffixes when the replacement manifest is atomically published. At twice the
+configured table threshold, writes wait for the pending run to bound read and
+space amplification. Setting the threshold to `0` disables automation.
+`Store::compact_in_background()` starts an explicit asynchronous run,
+`Store::wait_for_background_compaction()` waits for publication, and
+`Store::compaction_metrics()` reports input/output bytes and versions, duration,
+peak merge buffers, and foreground stalls. `Store::compact()` remains available
+for an explicit synchronous streaming run.
 
 ### Atomic batches
 
@@ -324,6 +331,6 @@ and a local performance baseline are implemented.
 The first persistence-hardening pass is complete: durable mode calls
 `sync_data`, recovery allocations are bounded, storage read failures propagate,
 memory/WAL flush limits are enforced, and a second writer is rejected. The
-benchmark-driven performance pass is active: bounded worker/group commit is in
-place, with SSTable caching and background streaming compaction next. See the
+benchmark-driven performance pass is active: bounded worker/group commit,
+SSTable caching, and background streaming compaction are in place. See the
 [prioritized roadmap](ROADMAP.md) for current status and acceptance criteria.

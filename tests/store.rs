@@ -528,6 +528,8 @@ fn later_flush_and_automatic_compaction_preserve_retention_boundary() {
         s.set_compaction_threshold(2);
         s.set_memtable_limit(1);
         s.set(b"key".to_vec(), b"v3".to_vec()).unwrap();
+        assert!(s.compaction_metrics().in_progress);
+        s.wait_for_background_compaction().unwrap();
         assert_eq!(s.sstable_count(), 1);
         assert_eq!(s.history_start_sequence(), 2);
         assert_eq!(s.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
@@ -556,11 +558,14 @@ fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     s.set(b"b".to_vec(), b"two".to_vec()).unwrap();
     assert_eq!(s.sstable_count(), 2);
     s.set(b"c".to_vec(), b"three".to_vec()).unwrap();
+    assert!(s.compaction_metrics().in_progress);
+    s.wait_for_background_compaction().unwrap();
     assert_eq!(s.sstable_count(), 1, "third table triggers compaction");
 
     assert!(s.delete(b"a").unwrap());
     assert_eq!(s.sstable_count(), 2);
     s.set(b"d".to_vec(), b"four".to_vec()).unwrap();
+    s.wait_for_background_compaction().unwrap();
     assert_eq!(s.sstable_count(), 1, "threshold triggers again");
     assert_eq!(s.get(b"a").unwrap(), None);
     assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
@@ -575,6 +580,71 @@ fn automatic_compaction_runs_at_threshold_and_survives_reopen() {
     assert_eq!(s.get(b"a").unwrap(), None);
     assert_eq!(s.get_at(b"a", 1).unwrap(), Some(b"one".to_vec()));
     assert_eq!(s.get(b"d").unwrap(), Some(b"four".to_vec()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn background_compaction_streams_while_new_writes_continue() {
+    let dir = tmp_dir("compact-background");
+    let wal = dir.join("kvdb.wal");
+    let mut s = Store::open(&wal).unwrap();
+    s.set_memtable_limit(usize::MAX);
+    s.set_compaction_threshold(3);
+
+    const KEYS: usize = 200;
+    const VALUE_BYTES: usize = 2 * 1024;
+    for generation in 0..3u8 {
+        for key in 0..KEYS {
+            s.set(
+                format!("key-{key:04}").into_bytes(),
+                vec![generation; VALUE_BYTES],
+            )
+            .unwrap();
+        }
+        s.flush().unwrap();
+    }
+
+    assert_eq!(s.sstable_count(), 3);
+    assert!(s.compaction_metrics().in_progress);
+
+    // This foreground flush is newer than every compaction input table and must
+    // remain as a suffix regardless of when the replacement is published.
+    s.set_memtable_limit(1);
+    s.set(b"key-0000".to_vec(), b"foreground-tail".to_vec())
+        .unwrap();
+    s.wait_for_background_compaction().unwrap();
+    assert_eq!(s.sstable_count(), 2);
+    assert_eq!(
+        s.get(b"key-0000").unwrap(),
+        Some(b"foreground-tail".to_vec())
+    );
+    assert_eq!(
+        s.get_at(b"key-0000", 1).unwrap(),
+        Some(vec![0; VALUE_BYTES])
+    );
+    assert_eq!(
+        s.get_at(b"key-0000", 201).unwrap(),
+        Some(vec![1; VALUE_BYTES])
+    );
+
+    let metrics = s.compaction_metrics();
+    assert_eq!(metrics.runs_started, 1);
+    assert_eq!(metrics.runs_completed, 1);
+    assert_eq!(metrics.runs_failed, 0);
+    assert_eq!(metrics.input_tables, 3);
+    assert_eq!(metrics.input_versions, (KEYS * 3) as u64);
+    assert_eq!(metrics.output_versions, (KEYS * 3) as u64);
+    assert!(metrics.input_bytes > metrics.output_bytes);
+    assert!(metrics.peak_buffer_bytes < 128 * 1024);
+
+    drop(s);
+    let s = Store::open(&wal).unwrap();
+    assert_eq!(
+        s.get(b"key-0000").unwrap(),
+        Some(b"foreground-tail".to_vec())
+    );
+    assert_eq!(s.get(b"key-0199").unwrap(), Some(vec![2; VALUE_BYTES]));
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -242,6 +242,9 @@ fn storage_worker(
 ) {
     let mut pending = None;
     loop {
+        if let Err(error) = store.poll_background_compaction() {
+            log_error!(TARGET, "background compaction publication failed: {error}");
+        }
         let command = match pending.take().or_else(|| receiver.blocking_recv()) {
             Some(command) => command,
             None => break,
