@@ -14,6 +14,8 @@ src/
 ├── lib.rs        — public module exports
 ├── store.rs      — WAL, memtable, manifest, recovery, MVCC, compaction
 ├── sstable.rs    — SSTable codec, sparse index, and Bloom filter
+├── checksum.rs   — shared dependency-free CRC32
+├── failpoint.rs  — opt-in debug crash injection
 ├── limits.rs     — storage input and allocation limits
 ├── http.rs       — Axum router, bounded storage worker, group commit, auth
 ├── log.rs        — dependency-free structured line logging
@@ -23,6 +25,7 @@ src/
 tests/
 ├── store.rs      — storage engine integration tests
 ├── http.rs       — HTTP router tests via tower oneshot
+├── crash.rs      — child-process storage crash matrix
 ├── load.rs       — ignored release-mode correctness workloads
 └── perf.rs       — ignored informational performance scenarios
 ```
@@ -75,6 +78,7 @@ Clients authenticate with HTTP Basic auth (`curl -u user:pass`, or the
 ```sh
 cargo build --release --locked
 cargo test --all --locked  # fast suite: storage engine + HTTP router tests
+cargo test --locked --test crash -- --test-threads=1
 
 # Heavier suites are opt-in (kept out of the default run):
 cargo test --release --locked --test load -- --ignored --nocapture --test-threads=1
@@ -83,6 +87,14 @@ cargo bench --locked --bench kvdb_bench -- --profile standard
 ```
 
 The repository pins Rust 1.96.0 in `rust-toolchain.toml`.
+
+The debug test suite includes a 14-point child-process crash matrix covering
+WAL write/sync, SSTable and manifest sync/rename, WAL truncation, and obsolete
+table deletion. Each child exits without running destructors; recovery must
+retain every operation recorded in a separately fsynced acknowledgement log,
+then accept another flush and reopen. Failpoints are compiled out of release
+builds and require both `KVDB_ENABLE_FAILPOINTS=1` and a selected internal
+`KVDB_FAILPOINT`, so normal debug runs remain inert.
 
 GitHub Actions runs formatting, Clippy, the fast suite, sequential release load
 tests, informational benchmarks, and a Docker persistence smoke test on every

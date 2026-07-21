@@ -4,9 +4,10 @@ Last reviewed: 2026-07-21.
 
 kvdb has a working single-node LSM-style engine, baseline persistence
 hardening, and a reproducible end-to-end benchmark. The controlled performance
-rebaseline is complete; the current goal is checksummed storage formats,
-pre-production versioning, and crash-point coverage while retaining the worker GET
-regression as explicit follow-up work.
+rebaseline is complete; the current goal is structured storage errors and the
+remaining integrity work, while stable format versioning is intentionally
+deferred until production preparation and the worker GET regression remains an
+explicit follow-up.
 
 ## Verified baseline
 
@@ -15,7 +16,7 @@ checks pass on that toolchain:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
-- `cargo test --all --locked` (66 passing tests, 19 intentionally ignored)
+- `cargo test --all --locked` (83 passing tests, 19 intentionally ignored)
 
 The four ignored load tests, 15 component microbenchmarks, and the quick
 end-to-end benchmark profile run as separate release-mode CI jobs. The
@@ -124,7 +125,8 @@ it.
    the before/after baseline.
 5. Add versioned checksummed WAL/SSTable/manifest formats and crash failpoints.
    Pre-release WAL/SSTable/manifest checksums and torn-tail repair are complete;
-   stable versioning and the crash matrix remain.
+   the 14-point crash matrix passes, while stable versioning remains deferred
+   until production preparation.
 6. Continue service lifecycle, API contract, delivery, and operations work.
 
 ## Completed hardening
@@ -152,7 +154,7 @@ SSTable or manifest fsyncs its parent directory on Unix.
 
 | ID | Severity | Status | Remaining risk |
 |---|---|---|---|
-| R2 | P0 | Partial | WAL records are length-delimited and checksummed, but stable format versioning and complete crash-point coverage remain. |
+| R2 | P0 | Partial | WAL records are length-delimited and checksummed and the storage crash matrix passes; stable production format versioning remains. |
 | R7 | P0 | Partial | WAL, SSTable blocks/index, and manifest metadata are checksummed; stable production versions and migration policy remain. |
 | R8 | P1 | Partial | A bounded worker and group commit replace the request-path mutex; cancellation and graceful worker shutdown remain, and standard TCP GET throughput regresses 28-76% depending on concurrency. |
 | R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` although reqwest has no TLS. |
@@ -241,7 +243,7 @@ compaction separately.
   checksummed manifest metadata.
 - [x] Bound manifest line/count parsing and validate filenames, duplicate entries,
   table ordering, sequence bounds, and table metadata during open.
-- Add failpoints around WAL write/sync, SSTable sync/rename, manifest
+- [x] Add failpoints around WAL write/sync, SSTable sync/rename, manifest
   sync/rename, WAL truncation, and obsolete-table deletion. Kill a child at
   each point and compare recovery with acknowledged operations.
 - Replace broad `io::Error` reporting with structured errors for invalid input,

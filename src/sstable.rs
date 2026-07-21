@@ -611,8 +611,11 @@ impl SsTable {
         w.write_all(&index_checksum.finish().to_be_bytes())?;
         w.write_all(FOOTER_MAGIC)?;
         w.flush()?;
+        crate::failpoint::hit("sstable_before_sync");
         w.get_ref().sync_all()?;
+        crate::failpoint::hit("sstable_after_sync");
         std::fs::rename(&tmp, path)?;
+        crate::failpoint::hit("sstable_after_rename");
         sync_parent_directory(path)?;
         Ok(SsTableWriteStats {
             records: record_count as u64,

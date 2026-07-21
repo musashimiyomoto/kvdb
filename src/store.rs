@@ -641,15 +641,18 @@ impl Store {
         let result = (|| {
             let write_started = Instant::now();
             write(&mut self.wal)?;
+            crate::failpoint::hit("wal_after_write");
             let write_micros = duration_micros(write_started.elapsed());
 
             let flush_started = Instant::now();
             self.wal.flush()?;
+            crate::failpoint::hit("wal_before_sync");
             let flush_micros = duration_micros(flush_started.elapsed());
 
             let sync_micros = if self.durability == Durability::Durable {
                 let sync_started = Instant::now();
                 self.wal.get_ref().sync_data()?;
+                crate::failpoint::hit("wal_after_sync");
                 duration_micros(sync_started.elapsed())
             } else {
                 0
@@ -950,7 +953,7 @@ impl Store {
         for old in retired {
             let old_path = dir.join(&old.name);
             self.sstable_cache.invalidate(&old_path);
-            if let Err(error) = std::fs::remove_file(&old_path) {
+            if let Err(error) = remove_obsolete_table(&old_path) {
                 log_warn!(
                     TARGET,
                     "could not remove superseded SSTable {}: {error}",
@@ -1073,7 +1076,7 @@ impl Store {
             }
             let old_path = dir.join(old_name);
             self.sstable_cache.invalidate(&old_path);
-            if let Err(e) = std::fs::remove_file(old_path) {
+            if let Err(e) = remove_obsolete_table(&old_path) {
                 log_warn!(
                     TARGET,
                     "could not remove superseded SSTable {old_name}: {e}"
@@ -1101,9 +1104,12 @@ impl Store {
     /// the append handle keeps writing new records from the (now empty) start.
     fn truncate_wal(&mut self) -> io::Result<()> {
         self.wal.flush()?;
+        crate::failpoint::hit("wal_before_truncate");
         let file = self.wal.get_mut();
         file.set_len(0)?;
+        crate::failpoint::hit("wal_after_set_len");
         file.sync_all()?;
+        crate::failpoint::hit("wal_after_truncate");
         self.wal_bytes = 0;
         Ok(())
     }
@@ -1544,6 +1550,13 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+fn remove_obsolete_table(path: &Path) -> io::Result<()> {
+    crate::failpoint::hit("obsolete_before_delete");
+    std::fs::remove_file(path)?;
+    crate::failpoint::hit("obsolete_after_delete");
+    Ok(())
+}
+
 fn duration_micros(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1790,8 +1803,11 @@ fn write_manifest(
         write_manifest_bytes(&mut file, &mut checksum, b"\n")?;
     }
     writeln!(file, "checksum={:08x}", checksum.finish())?;
+    crate::failpoint::hit("manifest_before_sync");
     file.sync_all()?;
+    crate::failpoint::hit("manifest_after_sync");
     std::fs::rename(&tmp, path)?;
+    crate::failpoint::hit("manifest_after_rename");
     sync_parent_directory(path)?;
     Ok(())
 }
