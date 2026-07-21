@@ -32,12 +32,12 @@ flushed, and synchronized with `sync_data` before it is applied to the memtable
 or acknowledged. A trailing record left torn by a crash is treated as
 uncommitted and physically removed during recovery; checksum failures and
 malformed complete records are rejected as corruption. WAL records use
-independently versioned `KVW2` frames containing a bounded payload length and
-CRC32 over the version, encoded length, and payload. Existing unframed WALs are
-validated and atomically migrated through a synced temporary file on first
-open. `KVDB_DURABILITY=buffered` is an explicit performance mode that flushes
-only to the operating system and can lose acknowledged writes after an OS crash
-or power loss.
+pre-release `KVWL` frames containing a bounded payload length and CRC32 over the
+magic, encoded length, and payload. Files written by earlier unreleased builds
+are intentionally not migrated. A stable format version and migration policy
+will be established before production use. `KVDB_DURABILITY=buffered` is an
+explicit performance mode that flushes only to the operating system and can
+lose acknowledged writes after an OS crash or power loss.
 
 HTTP storage operations run on one dedicated blocking worker behind a bounded
 FIFO queue. Adjacent writes are committed as separate logical WAL records and
@@ -340,10 +340,10 @@ memtables, indexed and Bloom-filtered SSTables, atomic batches, snapshots,
 optimistic transactions, MVCC retention, compaction, HTTP access, load tests,
 and a local performance baseline are implemented.
 
-The persistence-hardening work now includes versioned, length-delimited,
-checksummed WAL frames, automatic legacy migration, torn-tail repair, bounded
-recovery allocations, propagated storage failures, memory/WAL flush limits,
-and single-writer enforcement. SSTable/manifest checksums and crash failpoints
-remain. The benchmark-driven performance pass has bounded worker/group commit,
-SSTable caching, and background streaming compaction in place. See the
-[prioritized roadmap](ROADMAP.md) for current status and acceptance criteria.
+The persistence-hardening work now includes length-delimited, checksummed WAL
+frames, torn-tail repair, bounded recovery allocations, propagated storage
+failures, memory/WAL flush limits, and single-writer enforcement. Stable format
+versioning, SSTable/manifest checksums, and crash failpoints remain. The
+benchmark-driven performance pass has bounded worker/group commit, SSTable
+caching, and background streaming compaction in place. See the [prioritized
+roadmap](ROADMAP.md) for current status and acceptance criteria.

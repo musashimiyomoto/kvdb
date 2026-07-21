@@ -25,9 +25,18 @@ fn tmp_dir(tag: &str) -> PathBuf {
     p
 }
 
-fn append_legacy_chunk(bytes: &mut Vec<u8>, value: &[u8]) {
-    bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(value);
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = u32::MAX;
+    for part in parts {
+        for &byte in *part {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+    }
+    !crc
 }
 
 #[test]
@@ -1049,9 +1058,13 @@ fn corrupted_live_sstable_is_rejected_on_reopen() {
 #[test]
 fn unknown_wal_opcode_is_a_hard_error() {
     let path = tmp_path("bad-opcode");
-    // A single byte 0x07 is not a valid op code; recovery must refuse it
-    // (unlike a torn tail, which is tolerated).
-    std::fs::write(&path, [0x07u8]).unwrap();
+    let payload = [0x07u8];
+    let length = (payload.len() as u32).to_be_bytes();
+    let mut frame = b"KVWL".to_vec();
+    frame.extend_from_slice(&length);
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&crc32(&[b"KVWL", &length, &payload]).to_be_bytes());
+    std::fs::write(&path, frame).unwrap();
 
     let err = match Store::open(&path) {
         Ok(_) => panic!("expected an error for an unknown WAL op code"),
@@ -1078,7 +1091,7 @@ fn torn_wal_tail_is_dropped_but_prior_records_survive() {
             .append(true)
             .open(&path)
             .unwrap();
-        f.write_all(b"KVW2\x01\x00").unwrap();
+        f.write_all(b"KVWL\x00").unwrap();
     }
 
     // Recovery physically drops the torn tail, so a later append remains
@@ -1195,79 +1208,18 @@ fn oversized_input_is_rejected_without_poisoning_the_store() {
 }
 
 #[test]
-fn oversized_wal_length_is_rejected_before_allocation() {
-    let path = tmp_path("oversized-wal");
+fn obsolete_unframed_wal_is_rejected() {
+    let path = tmp_path("unframed-wal");
     let mut bytes = vec![1u8];
     bytes.extend_from_slice(&1u64.to_be_bytes());
     bytes.extend_from_slice(&u32::MAX.to_be_bytes());
     std::fs::write(&path, bytes).unwrap();
 
     let error = match Store::open(&path) {
-        Ok(_) => panic!("expected oversized WAL field to fail"),
+        Ok(_) => panic!("expected obsolete unframed WAL to fail"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn legacy_wal_is_migrated_to_framed_records() {
-    let path = tmp_path("legacy-wal-migration");
-    let mut bytes = Vec::new();
-
-    bytes.push(1); // SET, sequence 1
-    bytes.extend_from_slice(&1u64.to_be_bytes());
-    append_legacy_chunk(&mut bytes, b"old");
-    append_legacy_chunk(&mut bytes, b"value");
-
-    bytes.push(2); // DELETE, sequence 2
-    bytes.extend_from_slice(&2u64.to_be_bytes());
-    append_legacy_chunk(&mut bytes, b"old");
-
-    bytes.push(3); // BATCH, sequence 3
-    bytes.extend_from_slice(&3u64.to_be_bytes());
-    bytes.extend_from_slice(&2u32.to_be_bytes());
-    bytes.push(1); // SET live=kept
-    append_legacy_chunk(&mut bytes, b"live");
-    append_legacy_chunk(&mut bytes, b"kept");
-    bytes.push(2); // DELETE absent
-    append_legacy_chunk(&mut bytes, b"absent");
-    std::fs::write(&path, bytes).unwrap();
-
-    let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.current_sequence(), 3);
-    assert_eq!(store.get(b"old").unwrap(), None);
-    assert_eq!(store.get(b"live").unwrap(), Some(b"kept".to_vec()));
-    assert!(std::fs::read(&path).unwrap().starts_with(b"KVW2"));
-    store.set(b"new".to_vec(), b"framed".to_vec()).unwrap();
-    drop(store);
-
-    let store = Store::open(&path).unwrap();
-    assert_eq!(store.current_sequence(), 4);
-    assert_eq!(store.get(b"live").unwrap(), Some(b"kept".to_vec()));
-    assert_eq!(store.get(b"new").unwrap(), Some(b"framed".to_vec()));
-    std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn legacy_migration_discards_a_torn_tail() {
-    let path = tmp_path("legacy-torn-migration");
-    let mut bytes = vec![1]; // complete SET, sequence 1
-    bytes.extend_from_slice(&1u64.to_be_bytes());
-    append_legacy_chunk(&mut bytes, b"good");
-    append_legacy_chunk(&mut bytes, b"kept");
-    bytes.extend_from_slice(&[1, 0, 0]); // torn second SET
-    std::fs::write(&path, bytes).unwrap();
-
-    let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.get(b"good").unwrap(), Some(b"kept".to_vec()));
-    assert!(std::fs::read(&path).unwrap().starts_with(b"KVW2"));
-    store.set(b"later".to_vec(), b"reachable".to_vec()).unwrap();
-    drop(store);
-
-    let store = Store::open(&path).unwrap();
-    assert_eq!(store.get(b"good").unwrap(), Some(b"kept".to_vec()));
-    assert_eq!(store.get(b"later").unwrap(), Some(b"reachable".to_vec()));
     std::fs::remove_file(&path).ok();
 }
 
@@ -1292,18 +1244,18 @@ fn wal_checksum_corruption_is_a_hard_error() {
 }
 
 #[test]
-fn unknown_wal_frame_version_is_a_hard_error() {
-    let path = tmp_path("wal-version");
+fn invalid_wal_frame_magic_is_a_hard_error() {
+    let path = tmp_path("wal-magic");
     {
         let mut store = Store::open(&path).unwrap();
         store.set(b"key".to_vec(), b"value".to_vec()).unwrap();
     }
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[4] = 2;
+    bytes[3] = b'X';
     std::fs::write(&path, bytes).unwrap();
 
     let error = match Store::open(&path) {
-        Ok(_) => panic!("expected unsupported WAL frame version to fail"),
+        Ok(_) => panic!("expected invalid WAL frame magic to fail"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -1313,7 +1265,7 @@ fn unknown_wal_frame_version_is_a_hard_error() {
 #[test]
 fn oversized_framed_wal_length_is_rejected_before_allocation() {
     let path = tmp_path("oversized-framed-wal");
-    let mut bytes = b"KVW2\x01".to_vec();
+    let mut bytes = b"KVWL".to_vec();
     bytes.extend_from_slice(&u32::MAX.to_be_bytes());
     std::fs::write(&path, bytes).unwrap();
 

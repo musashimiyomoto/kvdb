@@ -33,9 +33,8 @@ use crate::{log_debug, log_info, log_warn};
 const OP_SET: u8 = 1;
 const OP_DELETE: u8 = 2;
 const OP_BATCH: u8 = 3;
-const WAL_FRAME_MAGIC: &[u8; 4] = b"KVW2";
-const WAL_FRAME_VERSION: u8 = 1;
-const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_MAGIC.len() + 1 + 4;
+const WAL_FRAME_MAGIC: &[u8; 4] = b"KVWL";
+const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_MAGIC.len() + 4;
 const WAL_FRAME_CHECKSUM_BYTES: usize = 4;
 
 /// Default memtable size (live + tombstone entries) that triggers a flush.
@@ -343,12 +342,8 @@ impl Store {
 
         // 2. Replay the WAL (writes since the last flush) on top of the SSTables.
         let replay = Self::replay(&wal_path, manifest.sequence)?;
-        match replay.format {
-            WalFormat::Legacy => migrate_legacy_wal(&wal_path, replay.valid_bytes)?,
-            WalFormat::Framed if replay.physical_bytes > replay.valid_bytes => {
-                truncate_torn_wal_tail(&wal_path, replay.valid_bytes)?;
-            }
-            WalFormat::Framed => {}
+        if replay.physical_bytes > replay.valid_bytes {
+            truncate_torn_wal_tail(&wal_path, replay.valid_bytes)?;
         }
         let memtable = replay.memtable;
         let sequence = replay.sequence;
@@ -411,7 +406,6 @@ impl Store {
                 return Ok(ReplayState {
                     memtable: map,
                     sequence,
-                    format: WalFormat::Framed,
                     valid_bytes: 0,
                     physical_bytes: 0,
                 });
@@ -420,15 +414,11 @@ impl Store {
         };
         let physical_bytes = file.metadata()?.len();
         let mut reader = BufReader::new(file);
-        let format = detect_wal_format(&mut reader)?;
+        validate_wal_magic(&mut reader)?;
         let mut valid_bytes = 0;
 
         loop {
-            let decoded = match format {
-                WalFormat::Legacy => read_legacy_record(&mut reader),
-                WalFormat::Framed => read_framed_record(&mut reader),
-            };
-            match decoded {
+            match read_framed_record(&mut reader) {
                 Ok(Some(record)) if record.sequence() <= durable_sequence => {
                     valid_bytes = reader.stream_position()?;
                 }
@@ -452,7 +442,6 @@ impl Store {
         Ok(ReplayState {
             memtable: map,
             sequence,
-            format,
             valid_bytes,
             physical_bytes,
         })
@@ -1681,16 +1670,9 @@ enum Record {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WalFormat {
-    Legacy,
-    Framed,
-}
-
 struct ReplayState {
     memtable: MemTable,
     sequence: u64,
-    format: WalFormat,
     valid_bytes: u64,
     physical_bytes: u64,
 }
@@ -1793,15 +1775,15 @@ fn memtable_metrics(memtable: &MemTable) -> (usize, usize) {
     (bytes, version_count)
 }
 
-/// Encodes a framed SET record whose payload is the legacy logical encoding.
+/// Encodes a framed SET record.
 fn write_set<W: Write>(w: &mut W, sequence: u64, key: &[u8], value: &[u8]) -> io::Result<()> {
     let mut payload = Vec::new();
-    write_legacy_set(&mut payload, sequence, key, value)?;
+    write_set_payload(&mut payload, sequence, key, value)?;
     write_wal_frame(w, &payload)
 }
 
 /// Encodes a SET payload: `[OP_SET][sequence][key_len][key][val_len][value]`.
-fn write_legacy_set<W: Write>(
+fn write_set_payload<W: Write>(
     w: &mut W,
     sequence: u64,
     key: &[u8],
@@ -1815,15 +1797,15 @@ fn write_legacy_set<W: Write>(
     Ok(())
 }
 
-/// Encodes a framed DELETE record whose payload is the legacy encoding.
+/// Encodes a framed DELETE record.
 fn write_delete<W: Write>(w: &mut W, sequence: u64, key: &[u8]) -> io::Result<()> {
     let mut payload = Vec::new();
-    write_legacy_delete(&mut payload, sequence, key)?;
+    write_delete_payload(&mut payload, sequence, key)?;
     write_wal_frame(w, &payload)
 }
 
 /// Encodes a DELETE payload: `[OP_DELETE][sequence][key_len][key]`.
-fn write_legacy_delete<W: Write>(w: &mut W, sequence: u64, key: &[u8]) -> io::Result<()> {
+fn write_delete_payload<W: Write>(w: &mut W, sequence: u64, key: &[u8]) -> io::Result<()> {
     validate_delete_record(key, io::ErrorKind::InvalidInput)?;
     w.write_all(&[OP_DELETE])?;
     w.write_all(&sequence.to_be_bytes())?;
@@ -1839,11 +1821,11 @@ fn write_batch<W: Write>(
     operations: &[BatchOperation],
 ) -> io::Result<()> {
     let mut payload = Vec::new();
-    write_legacy_batch(&mut payload, sequence, operations)?;
+    write_batch_payload(&mut payload, sequence, operations)?;
     write_wal_frame(w, &payload)
 }
 
-fn write_legacy_batch<W: Write>(
+fn write_batch_payload<W: Write>(
     w: &mut W,
     sequence: u64,
     operations: &[BatchOperation],
@@ -1869,8 +1851,8 @@ fn write_legacy_batch<W: Write>(
     Ok(())
 }
 
-/// Reads one legacy record from `r`. Returns `Ok(None)` at a clean end.
-fn read_legacy_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
+/// Reads one frame payload from `r`. Returns `Ok(None)` at a clean end.
+fn read_payload_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     let mut op = [0u8; 1];
     match r.read_exact(&mut op) {
         Ok(()) => {}
@@ -1878,10 +1860,10 @@ fn read_legacy_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
         Err(e) => return Err(e),
     }
 
-    read_legacy_record_with_op(r, op[0]).map(Some)
+    read_payload_record_with_op(r, op[0]).map(Some)
 }
 
-fn read_legacy_record_with_op<R: Read>(r: &mut R, op: u8) -> io::Result<Record> {
+fn read_payload_record_with_op<R: Read>(r: &mut R, op: u8) -> io::Result<Record> {
     match op {
         OP_SET => {
             let sequence = read_sequence(r)?;
@@ -1934,32 +1916,12 @@ fn write_wal_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "WAL record exceeds size limit")
     })?;
     let length_bytes = payload_len.to_be_bytes();
-    let checksum = wal_frame_checksum(WAL_FRAME_VERSION, &length_bytes, payload);
+    let checksum = wal_frame_checksum(&length_bytes, payload);
 
     w.write_all(WAL_FRAME_MAGIC)?;
-    w.write_all(&[WAL_FRAME_VERSION])?;
     w.write_all(&length_bytes)?;
     w.write_all(payload)?;
     w.write_all(&checksum.to_be_bytes())
-}
-
-fn write_framed_record<W: Write>(w: &mut W, record: &Record) -> io::Result<()> {
-    let mut payload = Vec::new();
-    match record {
-        Record::Set {
-            sequence,
-            key,
-            value,
-        } => write_legacy_set(&mut payload, *sequence, key, value)?,
-        Record::Delete { sequence, key } => {
-            write_legacy_delete(&mut payload, *sequence, key)?;
-        }
-        Record::Batch {
-            sequence,
-            operations,
-        } => write_legacy_batch(&mut payload, *sequence, operations)?,
-    }
-    write_wal_frame(w, &payload)
 }
 
 fn read_framed_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
@@ -1974,13 +1936,7 @@ fn read_framed_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     if &header[..WAL_FRAME_MAGIC.len()] != WAL_FRAME_MAGIC {
         return Err(invalid_data("invalid WAL frame magic"));
     }
-    let version = header[WAL_FRAME_MAGIC.len()];
-    if version != WAL_FRAME_VERSION {
-        return Err(invalid_data(format!(
-            "unsupported WAL frame version: {version}"
-        )));
-    }
-    let length_offset = WAL_FRAME_MAGIC.len() + 1;
+    let length_offset = WAL_FRAME_MAGIC.len();
     let mut length_bytes = [0u8; 4];
     length_bytes.copy_from_slice(&header[length_offset..]);
     let payload_len = u32::from_be_bytes(length_bytes) as usize;
@@ -1993,13 +1949,13 @@ fn read_framed_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     let mut checksum_bytes = [0u8; WAL_FRAME_CHECKSUM_BYTES];
     r.read_exact(&mut checksum_bytes)?;
     let stored_checksum = u32::from_be_bytes(checksum_bytes);
-    let actual_checksum = wal_frame_checksum(version, &length_bytes, &payload);
+    let actual_checksum = wal_frame_checksum(&length_bytes, &payload);
     if stored_checksum != actual_checksum {
         return Err(invalid_data("WAL frame checksum mismatch"));
     }
 
     let mut cursor = Cursor::new(payload.as_slice());
-    let record = read_legacy_record(&mut cursor)?
+    let record = read_payload_record(&mut cursor)?
         .ok_or_else(|| invalid_data("WAL frame contains an empty payload"))?;
     if cursor.position() != payload.len() as u64 {
         return Err(invalid_data("WAL frame payload contains trailing bytes"));
@@ -2007,8 +1963,8 @@ fn read_framed_record<R: Read>(r: &mut R) -> io::Result<Option<Record>> {
     Ok(Some(record))
 }
 
-fn wal_frame_checksum(version: u8, length_bytes: &[u8; 4], payload: &[u8]) -> u32 {
-    crc32(&[&[version], length_bytes, payload])
+fn wal_frame_checksum(length_bytes: &[u8; 4], payload: &[u8]) -> u32 {
+    crc32(&[WAL_FRAME_MAGIC, length_bytes, payload])
 }
 
 fn crc32(parts: &[&[u8]]) -> u32 {
@@ -2025,31 +1981,13 @@ fn crc32(parts: &[&[u8]]) -> u32 {
     !crc
 }
 
-fn detect_wal_format<R: BufRead>(reader: &mut R) -> io::Result<WalFormat> {
-    Ok(match reader.fill_buf()?.first() {
-        None => WalFormat::Framed,
-        Some(first) if *first == WAL_FRAME_MAGIC[0] => WalFormat::Framed,
-        Some(_) => WalFormat::Legacy,
-    })
-}
-
-fn migrate_legacy_wal(path: &Path, valid_bytes: u64) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".migrate.tmp");
-    let tmp = PathBuf::from(tmp);
-
-    let source = File::open(path)?;
-    let mut reader = BufReader::new(source.take(valid_bytes));
-    let target = File::create(&tmp)?;
-    let mut writer = BufWriter::new(target);
-    while let Some(record) = read_legacy_record(&mut reader)? {
-        write_framed_record(&mut writer, &record)?;
+fn validate_wal_magic<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    let available = reader.fill_buf()?;
+    let prefix_len = available.len().min(WAL_FRAME_MAGIC.len());
+    if available[..prefix_len] != WAL_FRAME_MAGIC[..prefix_len] {
+        return Err(invalid_data("invalid WAL frame magic"));
     }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-    std::fs::rename(&tmp, path)?;
-    sync_parent_directory(path)
+    Ok(())
 }
 
 fn truncate_torn_wal_tail(path: &Path, valid_bytes: u64) -> io::Result<()> {
