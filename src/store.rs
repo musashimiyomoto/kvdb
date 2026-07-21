@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::checksum::{Crc32, crc32};
+use crate::error::{StorageError, StorageResult};
 use crate::limits::{
     MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_LINE_BYTES,
     MAX_MANIFEST_SSTABLES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES,
@@ -192,49 +193,8 @@ impl Transaction {
     }
 }
 
-/// Failure to commit an optimistic [`Transaction`].
-#[derive(Debug)]
-pub enum TransactionError {
-    /// Another commit changed the Store after this transaction's snapshot.
-    Conflict {
-        key: Vec<u8>,
-        expected: u64,
-        actual: u64,
-    },
-    /// The atomic WAL batch could not be committed.
-    Io(io::Error),
-}
-
-impl std::fmt::Display for TransactionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransactionError::Conflict {
-                key,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "transaction conflict for key {key:?}: expected at most sequence {expected}, actual {actual}"
-            ),
-            TransactionError::Io(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for TransactionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            TransactionError::Conflict { .. } => None,
-            TransactionError::Io(error) => Some(error),
-        }
-    }
-}
-
-impl From<io::Error> for TransactionError {
-    fn from(error: io::Error) -> Self {
-        TransactionError::Io(error)
-    }
-}
+/// Backward-compatible name for the error returned by transaction commits.
+pub type TransactionError = StorageError;
 
 impl WriteBatch {
     pub fn new() -> Self {
@@ -307,7 +267,7 @@ impl Store {
     /// Opens (or creates) a store whose WAL lives at `wal_path`. Loads the
     /// SSTables named in the manifest, then replays any WAL records left over
     /// from writes that had not yet been flushed, rebuilding the memtable.
-    pub fn open<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(wal_path: P) -> StorageResult<Self> {
         let wal_path = wal_path.as_ref().to_path_buf();
 
         let lock_path = lock_path(&wal_path);
@@ -344,12 +304,14 @@ impl Store {
             if max_sequence > manifest.sequence {
                 return Err(invalid_data(format!(
                     "SSTable {name} is newer than the manifest sequence"
-                )));
+                ))
+                .into());
             }
             if previous_table_max.is_some_and(|previous| previous >= min_sequence) {
                 return Err(invalid_data(
                     "manifest SSTables have overlapping or unordered sequence ranges",
-                ));
+                )
+                .into());
             }
             previous_table_max = Some(max_sequence);
             sstables.push(LiveSsTable {
@@ -467,7 +429,7 @@ impl Store {
     }
 
     /// Returns the value for `key`, if present and not deleted.
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         validate_key(key, io::ErrorKind::InvalidInput)?;
         Ok(match self.lookup(key)? {
             Some(Value::Set(value)) => Some(value),
@@ -479,7 +441,7 @@ impl Store {
     ///
     /// Returns an error if the requested sequence predates retained history or
     /// is newer than this Store. Use [`Self::get`] for the current value.
-    pub fn get_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<Vec<u8>>> {
+    pub fn get_at(&self, key: &[u8], sequence: u64) -> StorageResult<Option<Vec<u8>>> {
         self.validate_historical_sequence(sequence)?;
         Ok(match self.lookup_at_result(key, sequence)? {
             Some(Value::Set(value)) => Some(value),
@@ -489,11 +451,11 @@ impl Store {
 
     /// Resolves a key across every level, newest to oldest, returning the first
     /// record found (which may be a tombstone). `None` means no level knows it.
-    fn lookup(&self, key: &[u8]) -> io::Result<Option<Value>> {
+    fn lookup(&self, key: &[u8]) -> StorageResult<Option<Value>> {
         self.lookup_at_result(key, u64::MAX)
     }
 
-    fn lookup_at_result(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
+    fn lookup_at_result(&self, key: &[u8], sequence: u64) -> StorageResult<Option<Value>> {
         // Memtable is newest.
         if let Some(versions) = self.memtable.get(key)
             && let Some(version) = versions
@@ -515,7 +477,7 @@ impl Store {
     }
 
     /// Inserts or overwrites `key` with `value`, durably. May trigger a flush.
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> StorageResult<()> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         validate_key(&key, io::ErrorKind::InvalidInput)?;
@@ -530,7 +492,7 @@ impl Store {
     /// Records a delete for `key`, durably. Returns whether a *live* value
     /// existed beforehand (preserving the HTTP layer's 404 semantics). The
     /// delete is stored as a tombstone regardless. May trigger a flush.
-    pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+    pub fn delete(&mut self, key: &[u8]) -> StorageResult<bool> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         validate_key(key, io::ErrorKind::InvalidInput)?;
@@ -549,7 +511,7 @@ impl Store {
     /// Commits all operations atomically as one WAL record. Recovery applies
     /// either the complete batch or none of it if the trailing record is torn.
     /// Operations are applied in order, so the last operation for a key wins.
-    pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<u64> {
+    pub fn write_batch(&mut self, batch: WriteBatch) -> StorageResult<u64> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         if batch.is_empty() {
@@ -573,7 +535,7 @@ impl Store {
     /// monotonically increasing sequence. All input is validated before any WAL
     /// bytes are written, and no memtable mutation is applied until the complete
     /// group has been flushed (and synced in [`Durability::Durable`] mode).
-    pub fn write_group(&mut self, batches: Vec<WriteBatch>) -> io::Result<Vec<u64>> {
+    pub fn write_group(&mut self, batches: Vec<WriteBatch>) -> StorageResult<Vec<u64>> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         for batch in &batches {
@@ -616,14 +578,15 @@ impl Store {
         Ok(sequences)
     }
 
-    fn next_sequence(&self) -> io::Result<u64> {
-        self.sequence
+    fn next_sequence(&self) -> StorageResult<u64> {
+        Ok(self
+            .sequence
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("commit sequence exhausted"))
+            .ok_or_else(|| io::Error::other("commit sequence exhausted"))?)
     }
 
     /// Flushes the memtable to a new SSTable if it has reached the limit.
-    fn maybe_flush(&mut self) -> io::Result<()> {
+    fn maybe_flush(&mut self) -> StorageResult<()> {
         if self.memtable.len() >= self.memtable_limit
             || self.memtable_bytes >= self.memtable_bytes_limit
             || self.memtable_versions >= self.memtable_versions_limit
@@ -637,7 +600,7 @@ impl Store {
     fn persist_wal(
         &mut self,
         write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-    ) -> io::Result<()> {
+    ) -> StorageResult<()> {
         let result = (|| {
             let write_started = Instant::now();
             write(&mut self.wal)?;
@@ -671,11 +634,9 @@ impl Store {
         result
     }
 
-    fn ensure_writable(&self) -> io::Result<()> {
+    fn ensure_writable(&self) -> StorageResult<()> {
         if self.poisoned {
-            return Err(io::Error::other(
-                "store is poisoned after an uncertain storage failure; reopen it before writing",
-            ));
+            return Err(StorageError::Poisoned);
         }
         Ok(())
     }
@@ -710,7 +671,7 @@ impl Store {
     /// and ignored, and un-truncated WAL records simply replay (newest wins).
     ///
     /// A no-op on an empty memtable.
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> StorageResult<()> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         let result = self.flush_inner();
@@ -720,7 +681,7 @@ impl Store {
         result
     }
 
-    fn flush_inner(&mut self) -> io::Result<()> {
+    fn flush_inner(&mut self) -> StorageResult<()> {
         if self.memtable.is_empty() {
             return Ok(());
         }
@@ -775,7 +736,7 @@ impl Store {
         self.maybe_compact()
     }
 
-    fn maybe_compact(&mut self) -> io::Result<()> {
+    fn maybe_compact(&mut self) -> StorageResult<()> {
         self.poll_background_compaction()?;
         let Some(threshold) = self.compaction_threshold else {
             return Ok(());
@@ -796,7 +757,7 @@ impl Store {
 
     /// Starts a full streaming compaction without blocking for the merge.
     /// Returns `false` when fewer than two tables are live or a run is pending.
-    pub fn compact_in_background(&mut self) -> io::Result<bool> {
+    pub fn compact_in_background(&mut self) -> StorageResult<bool> {
         self.poll_background_compaction()?;
         self.ensure_writable()?;
         if self.background_compaction.is_some() || self.sstables.len() < 2 {
@@ -806,7 +767,7 @@ impl Store {
         Ok(true)
     }
 
-    fn spawn_background_compaction(&mut self) -> io::Result<()> {
+    fn spawn_background_compaction(&mut self) -> StorageResult<()> {
         if self.background_compaction.is_some() || self.sstables.len() < 2 {
             return Ok(());
         }
@@ -835,7 +796,7 @@ impl Store {
 
     /// Publishes a completed automatic compaction without waiting for one that
     /// is still running. Returns whether a result was adopted.
-    pub(crate) fn poll_background_compaction(&mut self) -> io::Result<bool> {
+    pub(crate) fn poll_background_compaction(&mut self) -> StorageResult<bool> {
         if !self
             .background_compaction
             .as_ref()
@@ -847,22 +808,24 @@ impl Store {
     }
 
     /// Waits for the current automatic compaction and crash-safely publishes it.
-    pub fn wait_for_background_compaction(&mut self) -> io::Result<bool> {
+    pub fn wait_for_background_compaction(&mut self) -> StorageResult<bool> {
         if self.background_compaction.is_none() {
             return Ok(false);
         }
         self.finish_background_compaction()
     }
 
-    fn finish_background_compaction(&mut self) -> io::Result<bool> {
+    fn finish_background_compaction(&mut self) -> StorageResult<bool> {
         let job = self
             .background_compaction
             .take()
             .expect("background compaction exists");
         let result = match job.handle.join() {
-            Ok(result) => result
-                .and_then(|build| self.publish_background_compaction(&job.target_names, build)),
-            Err(_) => Err(io::Error::other("background compaction thread panicked")),
+            Ok(Ok(build)) => self.publish_background_compaction(&job.target_names, build),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(StorageError::unavailable(io::Error::other(
+                "background compaction thread panicked",
+            ))),
         };
 
         self.compaction_metrics.in_progress = false;
@@ -892,16 +855,16 @@ impl Store {
         &mut self,
         target_names: &[String],
         mut build: CompactionBuild,
-    ) -> io::Result<CompactionBuild> {
+    ) -> StorageResult<CompactionBuild> {
         if self.sstables.len() < target_names.len()
             || self.sstables[..target_names.len()]
                 .iter()
                 .map(|table| &table.name)
                 .ne(target_names.iter())
         {
-            return Err(io::Error::other(
+            return Err(StorageError::unavailable(io::Error::other(
                 "live SSTables changed while background compaction was running",
-            ));
+            )));
         }
 
         let dir = parent_dir(&self.wal_path);
@@ -979,7 +942,7 @@ impl Store {
     /// and fsync the replacement table, atomically publish its manifest, then
     /// remove superseded files. A crash before the manifest update leaves the
     /// old set live; a crash after it leaves harmless orphaned old files.
-    pub fn compact(&mut self) -> io::Result<()> {
+    pub fn compact(&mut self) -> StorageResult<()> {
         self.wait_for_background_compaction()?;
         self.ensure_writable()?;
         let result = self.compact_sstables(self.history_start);
@@ -997,18 +960,16 @@ impl Store {
     /// anchor tombstone can be removed because a full compaction eliminates all
     /// older tables it would otherwise need to shadow. The boundary is durable
     /// and can only move forward.
-    pub fn compact_with_retention(&mut self, history_start: u64) -> io::Result<()> {
+    pub fn compact_with_retention(&mut self, history_start: u64) -> StorageResult<()> {
         self.wait_for_background_compaction()?;
         self.ensure_writable()?;
         if history_start < self.history_start {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(StorageError::invalid_input(
                 "history retention boundary cannot move backwards",
             ));
         }
         if history_start > self.sequence {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(StorageError::invalid_input(
                 "history retention boundary is newer than the Store",
             ));
         }
@@ -1024,7 +985,7 @@ impl Store {
         result
     }
 
-    fn compact_sstables(&mut self, history_start: u64) -> io::Result<()> {
+    fn compact_sstables(&mut self, history_start: u64) -> StorageResult<()> {
         if self.sstables.is_empty() {
             if history_start != self.history_start {
                 write_manifest(
@@ -1102,7 +1063,7 @@ impl Store {
     /// Empties the WAL file after its contents have been captured in an SSTable.
     /// The buffer is flushed first, then the file is truncated to zero length;
     /// the append handle keeps writing new records from the (now empty) start.
-    fn truncate_wal(&mut self) -> io::Result<()> {
+    fn truncate_wal(&mut self) -> StorageResult<()> {
         self.wal.flush()?;
         crate::failpoint::hit("wal_before_truncate");
         let file = self.wal.get_mut();
@@ -1128,7 +1089,7 @@ impl Store {
     /// those resolving to a live value -- O(keys), used for the startup summary
     /// and tests rather than a hot path. SSTables deliberately keep only sparse
     /// block indexes in memory.
-    pub fn len(&self) -> io::Result<usize> {
+    pub fn len(&self) -> StorageResult<usize> {
         let mut keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
         for sst in &self.sstables {
@@ -1144,7 +1105,7 @@ impl Store {
     }
 
     /// Whether the store currently exposes no live keys.
-    pub fn is_empty(&self) -> io::Result<bool> {
+    pub fn is_empty(&self) -> StorageResult<bool> {
         Ok(self.len()? == 0)
     }
 
@@ -1237,12 +1198,12 @@ impl Store {
 
     /// Captures all currently visible live values in an immutable read-only
     /// snapshot. Later writes, flushes, and compactions do not change it.
-    pub fn snapshot(&self) -> io::Result<Snapshot> {
+    pub fn snapshot(&self) -> StorageResult<Snapshot> {
         self.snapshot_at(self.sequence)
     }
 
     /// Reconstructs an immutable snapshot at a historical commit sequence.
-    pub fn snapshot_at(&self, sequence: u64) -> io::Result<Snapshot> {
+    pub fn snapshot_at(&self, sequence: u64) -> StorageResult<Snapshot> {
         self.validate_historical_sequence(sequence)?;
         let mut keys = std::collections::BTreeSet::new();
         keys.extend(self.memtable.keys().cloned());
@@ -1259,19 +1220,15 @@ impl Store {
         Ok(Snapshot { sequence, values })
     }
 
-    fn validate_historical_sequence(&self, sequence: u64) -> io::Result<()> {
+    fn validate_historical_sequence(&self, sequence: u64) -> StorageResult<()> {
         if sequence < self.history_start {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "sequence {sequence} predates retained history starting at {}",
-                    self.history_start
-                ),
-            ));
+            return Err(StorageError::invalid_input(format!(
+                "sequence {sequence} predates retained history starting at {}",
+                self.history_start
+            )));
         }
         if sequence > self.sequence {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(StorageError::invalid_input(
                 "sequence is newer than the Store",
             ));
         }
@@ -1279,7 +1236,7 @@ impl Store {
     }
 
     /// Starts an optimistic transaction over a fixed read-only snapshot.
-    pub fn begin_transaction(&self) -> io::Result<Transaction> {
+    pub fn begin_transaction(&self) -> StorageResult<Transaction> {
         let snapshot = self.snapshot()?;
         Ok(Transaction {
             base_sequence: snapshot.sequence(),
@@ -1292,10 +1249,7 @@ impl Store {
 
     /// Commits a transaction if no mutation has advanced the Store since its
     /// snapshot. All writes are persisted atomically through one [`WriteBatch`].
-    pub fn commit_transaction(
-        &mut self,
-        transaction: Transaction,
-    ) -> Result<u64, TransactionError> {
+    pub fn commit_transaction(&mut self, transaction: Transaction) -> StorageResult<u64> {
         let Transaction {
             base_sequence,
             batch,
@@ -1307,17 +1261,17 @@ impl Store {
         for key in read_set {
             let actual = self.last_modified_sequence(&key)?;
             if actual > base_sequence {
-                return Err(TransactionError::Conflict {
+                return Err(StorageError::Conflict {
                     key,
                     expected: base_sequence,
                     actual,
                 });
             }
         }
-        Ok(self.write_batch(batch)?)
+        self.write_batch(batch)
     }
 
-    fn last_modified_sequence(&self, key: &[u8]) -> io::Result<u64> {
+    fn last_modified_sequence(&self, key: &[u8]) -> StorageResult<u64> {
         let mut latest = self
             .memtable
             .get(key)
@@ -1499,7 +1453,7 @@ fn build_compaction(
     for (name, path) in inputs {
         tables.push(LiveSsTable {
             name,
-            table: SsTable::open(&path)?,
+            table: SsTable::open_with_cache(&path, SsTableCache::from_env())?,
         });
     }
     let mut merged = StreamingMerge::new(&tables, history_start)?;

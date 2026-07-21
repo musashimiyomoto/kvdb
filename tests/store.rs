@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use kvdb::limits::MAX_KEY_BYTES;
 use kvdb::sstable::{SsTable, VersionedValue};
-use kvdb::store::{Durability, Store, TransactionError, WriteBatch};
+use kvdb::store::{Durability, Store, WriteBatch};
+use kvdb::{StorageError, StorageErrorKind};
 
 /// Returns a fresh, unique temp WAL path and removes any leftover from a
 /// previous run with the same tag.
@@ -500,11 +501,11 @@ fn compaction_retention_keeps_boundary_state_and_survives_reopen() {
         assert_eq!(s.get(b"deleted").unwrap(), None);
         assert_eq!(
             s.get_at(b"changed", 2).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
+            StorageErrorKind::InvalidInput
         );
         assert_eq!(
             s.snapshot_at(2).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
+            StorageErrorKind::InvalidInput
         );
         assert!(s.compact_with_retention(2).is_err());
         assert!(s.compact_with_retention(6).is_err());
@@ -765,7 +766,7 @@ fn write_group_validates_every_batch_before_writing() {
     invalid.set(vec![b'x'; MAX_KEY_BYTES + 1], b"value".to_vec());
 
     let error = store.write_group(vec![valid, invalid]).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.kind(), StorageErrorKind::InvalidInput);
     assert_eq!(store.current_sequence(), 0);
     assert_eq!(store.get(b"valid").unwrap(), None);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
@@ -949,7 +950,7 @@ fn optimistic_transaction_conflict_has_no_partial_writes() {
     let error = s.commit_transaction(transaction).unwrap_err();
     assert!(matches!(
         error,
-        TransactionError::Conflict {
+        StorageError::Conflict {
             expected: 1,
             actual: 2,
             ..
@@ -997,7 +998,7 @@ fn transaction_read_conflict_detects_a_key_added_after_snapshot() {
     let error = s.commit_transaction(transaction).unwrap_err();
     assert!(matches!(
         error,
-        TransactionError::Conflict { key, .. } if key == b"missing"
+        StorageError::Conflict { key, .. } if key == b"missing"
     ));
     assert_eq!(s.get(b"derived").unwrap(), None);
 
@@ -1019,7 +1020,7 @@ fn transaction_conflicts_when_a_read_value_changes_and_changes_back() {
     let error = s.commit_transaction(transaction).unwrap_err();
     assert!(matches!(
         error,
-        TransactionError::Conflict {
+        StorageError::Conflict {
             expected: 1,
             actual: 3,
             ..
@@ -1044,7 +1045,7 @@ fn manifest_rejects_history_boundary_newer_than_durable_sequence() {
         Ok(_) => panic!("expected invalid history boundary to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1072,7 +1073,7 @@ fn manifest_checksum_corruption_is_rejected() {
         Ok(_) => panic!("expected manifest checksum corruption to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("checksum mismatch"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1090,7 +1091,7 @@ fn manifest_rejects_oversized_lines_before_unbounded_allocation() {
         Ok(_) => panic!("expected oversized manifest line to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("line exceeds size limit"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1109,7 +1110,7 @@ fn manifest_rejects_excessive_sstable_count() {
         Ok(_) => panic!("expected excessive manifest table count to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("count exceeds limit"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1137,7 +1138,7 @@ fn manifest_rejects_noncanonical_and_duplicate_sstable_names() {
             Ok(_) => panic!("expected malformed manifest names to fail"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), StorageErrorKind::Corruption);
         assert!(error.to_string().contains(expected));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1163,7 +1164,7 @@ fn manifest_rejects_unordered_sstable_sequence_ranges() {
         Ok(_) => panic!("expected unordered SSTable sequence ranges to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("unordered sequence ranges"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1185,7 +1186,7 @@ fn manifest_rejects_sstable_newer_than_durable_sequence() {
         Ok(_) => panic!("expected newer SSTable metadata to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("newer than the manifest"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1209,7 +1210,7 @@ fn manifest_rejects_empty_live_sstable_metadata() {
         Ok(_) => panic!("expected empty live SSTable to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     assert!(error.to_string().contains("must not be empty"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1238,7 +1239,7 @@ fn corrupted_live_sstable_is_rejected_on_reopen() {
         Ok(_) => panic!("expected corrupted SSTable to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1258,7 +1259,7 @@ fn unknown_wal_opcode_is_a_hard_error() {
         Ok(_) => panic!("expected an error for an unknown WAL op code"),
         Err(e) => e,
     };
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(err.kind(), StorageErrorKind::Corruption);
 
     std::fs::remove_file(&path).ok();
 }
@@ -1307,7 +1308,11 @@ fn second_writer_is_rejected_until_first_store_closes() {
         Ok(_) => panic!("a second writer unexpectedly acquired the store"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(error.kind(), StorageErrorKind::Unavailable);
+    let StorageError::Unavailable { source } = error else {
+        panic!("expected unavailable I/O error");
+    };
+    assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
 
     drop(first);
     Store::open(&wal).unwrap();
@@ -1348,7 +1353,7 @@ fn failed_flush_poisons_writes_but_wal_recovers_after_reopen() {
     let error = store
         .set(b"rejected".to_vec(), b"value".to_vec())
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(matches!(error, StorageError::Poisoned));
 
     drop(store);
     std::fs::remove_dir(&manifest_tmp).unwrap();
@@ -1377,7 +1382,7 @@ fn corruption_encountered_after_open_is_returned_by_get() {
     drop(file);
 
     let error = store.get(b"key").unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1389,7 +1394,7 @@ fn oversized_input_is_rejected_without_poisoning_the_store() {
         .set(vec![0; MAX_KEY_BYTES + 1], b"value".to_vec())
         .unwrap_err();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.kind(), StorageErrorKind::InvalidInput);
     assert!(!store.is_poisoned());
     store.set(b"valid".to_vec(), b"value".to_vec()).unwrap();
     std::fs::remove_file(&path).ok();
@@ -1407,7 +1412,7 @@ fn obsolete_unframed_wal_is_rejected() {
         Ok(_) => panic!("expected obsolete unframed WAL to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     std::fs::remove_file(&path).ok();
 }
 
@@ -1427,7 +1432,7 @@ fn wal_checksum_corruption_is_a_hard_error() {
         Ok(_) => panic!("expected WAL checksum corruption to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     std::fs::remove_file(&path).ok();
 }
 
@@ -1446,7 +1451,7 @@ fn invalid_wal_frame_magic_is_a_hard_error() {
         Ok(_) => panic!("expected invalid WAL frame magic to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     std::fs::remove_file(&path).ok();
 }
 
@@ -1461,7 +1466,7 @@ fn oversized_framed_wal_length_is_rejected_before_allocation() {
         Ok(_) => panic!("expected oversized WAL frame to fail"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.kind(), StorageErrorKind::Corruption);
     std::fs::remove_file(&path).ok();
 }
 

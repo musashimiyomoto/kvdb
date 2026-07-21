@@ -256,7 +256,7 @@ applies either every operation or none of them if the trailing record is torn:
 ```rust
 use kvdb::{Store, WriteBatch};
 
-fn main() -> std::io::Result<()> {
+fn main() -> kvdb::StorageResult<()> {
     let mut store = Store::open("kvdb.wal")?;
     let mut batch = WriteBatch::new();
     batch
@@ -267,6 +267,12 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 ```
+
+All fallible public `Store` and `SsTable` operations return `StorageResult<T>`.
+`StorageError` separates invalid caller input, durable-data corruption,
+unavailable backing I/O, optimistic transaction conflicts, and a poisoned
+Store. Match its variants or use `StorageError::kind()`; unavailable errors
+retain the original `std::io::Error` as their source.
 
 `Store::snapshot()` returns an immutable read-only copy of all currently visible
 values together with its commit sequence. `snapshot_at(sequence)` reconstructs
@@ -283,8 +289,8 @@ the SSTables, and retains exact reads and snapshots from `history_start` onward.
 The newest value at or before that sequence is kept as an anchor for each key;
 an obsolete tombstone is removed once no older SSTable can resurface behind it.
 The boundary is persisted in the manifest and can only advance. Historical
-`get_at` and `snapshot_at` calls before the boundary return `InvalidInput`
-rather than a partial answer.
+`get_at` and `snapshot_at` calls before the boundary return
+`StorageError::InvalidInput` rather than a partial answer.
 
 ```rust
 store.compact_with_retention(10_000)?;

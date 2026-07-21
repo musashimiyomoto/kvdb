@@ -252,7 +252,7 @@ async fn storage_read_error_is_not_reported_as_not_found() {
     let auth = basic(USER, PASS);
     let (status, body) = send(&state, "GET", "/v1/keys/key", Some(&auth), "").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "storage unavailable\n");
+    assert_eq!(body, "storage corruption\n");
 
     drop(state);
     std::fs::remove_file(path.with_extension("manifest")).ok();

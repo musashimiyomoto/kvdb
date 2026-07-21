@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::checksum::{Crc32, crc32};
+use crate::error::StorageResult;
 use crate::limits::{
     MAX_BLOOM_FILTER_BYTES, MAX_BLOOM_HASHES, MAX_KEY_BYTES, MAX_SSTABLE_RECORD_BYTES,
     MAX_VALUE_BYTES, MAX_VERSIONS_PER_KEY,
@@ -509,7 +510,7 @@ impl SsTable {
     /// Writes sorted `entries` to a pre-release SSTable at `path`, atomically.
     /// The data and sparse index are streamed to a temp file, fsynced, and
     /// renamed into place, so a crash never leaves a half-written `path`.
-    pub fn write<'a, I>(path: &Path, entries: I) -> io::Result<()>
+    pub fn write<'a, I>(path: &Path, entries: I) -> StorageResult<()>
     where
         I: IntoIterator<Item = (&'a [u8], &'a [VersionedValue])>,
     {
@@ -625,8 +626,8 @@ impl SsTable {
     }
 
     /// Opens an existing table and loads its sparse index and Bloom filter.
-    pub fn open(path: &Path) -> io::Result<SsTable> {
-        Self::open_with_cache(path, SsTableCache::from_env())
+    pub fn open(path: &Path) -> StorageResult<SsTable> {
+        Ok(Self::open_with_cache(path, SsTableCache::from_env())?)
     }
 
     pub(crate) fn open_with_cache(path: &Path, cache: Arc<SsTableCache>) -> io::Result<SsTable> {
@@ -652,12 +653,12 @@ impl SsTable {
 
     /// Looks up `key`. Returns a live value, a tombstone, or no record. At most
     /// one data block is read after binary-searching the sparse index.
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
+    pub fn get(&self, key: &[u8]) -> StorageResult<Option<Value>> {
         self.get_at(key, u64::MAX)
     }
 
     /// Looks up the newest version whose sequence is at most `sequence`.
-    pub fn get_at(&self, key: &[u8], sequence: u64) -> io::Result<Option<Value>> {
+    pub fn get_at(&self, key: &[u8], sequence: u64) -> StorageResult<Option<Value>> {
         Ok(self.version_at(key, sequence)?.map(|version| version.value))
     }
 
@@ -685,7 +686,11 @@ impl SsTable {
     /// Reads every record in ascending key order. This is intentionally a disk
     /// scan: callers that need the full table must not force a dense resident
     /// index.
-    pub fn entries(&self) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
+    pub fn entries(&self) -> StorageResult<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
+        Ok(self.entries_io()?)
+    }
+
+    fn entries_io(&self) -> io::Result<Vec<(Vec<u8>, Vec<VersionedValue>)>> {
         let mut entries = Vec::with_capacity(self.len);
         if self.blocks.is_empty() {
             return Ok(entries);
@@ -740,7 +745,7 @@ impl SsTable {
 
     /// Reads every key in ascending order. This is intentionally a disk scan:
     /// callers that need the full key set must not force a dense resident index.
-    pub fn keys(&self) -> io::Result<Vec<Vec<u8>>> {
+    pub fn keys(&self) -> StorageResult<Vec<Vec<u8>>> {
         Ok(self.entries()?.into_iter().map(|(key, _)| key).collect())
     }
 
@@ -1683,7 +1688,7 @@ mod tests {
                 .map(|(key, versions)| (*key, versions.as_slice())),
         )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), crate::StorageErrorKind::InvalidInput);
         std::fs::remove_file(tmp_path(&path)).ok();
     }
 }

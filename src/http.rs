@@ -10,7 +10,6 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -28,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::log_error;
 use crate::store::{Durability, Store, WalCommitMetrics, WriteBatch};
+use crate::{StorageError, StorageErrorKind, StorageResult};
 
 const TARGET: &str = "kvdb::http";
 const DEFAULT_QUEUE_CAPACITY: usize = 1_024;
@@ -210,13 +210,13 @@ impl StorageHandle {
         Self { sender, metrics }
     }
 
-    async fn get(&self, key: Vec<u8>) -> Result<io::Result<Option<Vec<u8>>>, DispatchError> {
+    async fn get(&self, key: Vec<u8>) -> Result<StorageResult<Option<Vec<u8>>>, DispatchError> {
         let (response, receiver) = oneshot::channel();
         self.enqueue(StorageCommand::Get { key, response })?;
         receiver.await.map_err(|_| DispatchError::Closed)
     }
 
-    async fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<io::Result<()>, DispatchError> {
+    async fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<StorageResult<()>, DispatchError> {
         let (response, receiver) = oneshot::channel();
         self.enqueue(StorageCommand::Write(WriteCommand::Set {
             key,
@@ -226,7 +226,7 @@ impl StorageHandle {
         receiver.await.map_err(|_| DispatchError::Closed)
     }
 
-    async fn delete(&self, key: Vec<u8>) -> Result<io::Result<bool>, DispatchError> {
+    async fn delete(&self, key: Vec<u8>) -> Result<StorageResult<bool>, DispatchError> {
         let (response, receiver) = oneshot::channel();
         self.enqueue(StorageCommand::Write(WriteCommand::Delete {
             key,
@@ -258,7 +258,7 @@ struct QueuedStorageCommand {
 enum StorageCommand {
     Get {
         key: Vec<u8>,
-        response: oneshot::Sender<io::Result<Option<Vec<u8>>>>,
+        response: oneshot::Sender<StorageResult<Option<Vec<u8>>>>,
     },
     Write(WriteCommand),
 }
@@ -267,19 +267,19 @@ enum WriteCommand {
     Set {
         key: Vec<u8>,
         value: Vec<u8>,
-        response: oneshot::Sender<io::Result<()>>,
+        response: oneshot::Sender<StorageResult<()>>,
     },
     Delete {
         key: Vec<u8>,
-        response: oneshot::Sender<io::Result<bool>>,
+        response: oneshot::Sender<StorageResult<bool>>,
     },
 }
 
 enum WriteReply {
-    Set(oneshot::Sender<io::Result<()>>),
+    Set(oneshot::Sender<StorageResult<()>>),
     Delete {
         existed: bool,
-        response: oneshot::Sender<io::Result<bool>>,
+        response: oneshot::Sender<StorageResult<bool>>,
     },
 }
 
@@ -447,34 +447,30 @@ fn process_write_group(store: &mut Store, writes: Vec<WriteCommand>) -> Option<W
     }
 }
 
-fn fail_commands(commands: Vec<WriteCommand>, error: &io::Error) {
+fn fail_commands(commands: Vec<WriteCommand>, error: &StorageError) {
     for command in commands {
         match command {
             WriteCommand::Set { response, .. } => {
-                let _ = response.send(Err(copy_io_error(error)));
+                let _ = response.send(Err(error.clone()));
             }
             WriteCommand::Delete { response, .. } => {
-                let _ = response.send(Err(copy_io_error(error)));
+                let _ = response.send(Err(error.clone()));
             }
         }
     }
 }
 
-fn fail_replies(replies: Vec<WriteReply>, error: &io::Error) {
+fn fail_replies(replies: Vec<WriteReply>, error: &StorageError) {
     for reply in replies {
         match reply {
             WriteReply::Set(response) => {
-                let _ = response.send(Err(copy_io_error(error)));
+                let _ = response.send(Err(error.clone()));
             }
             WriteReply::Delete { response, .. } => {
-                let _ = response.send(Err(copy_io_error(error)));
+                let _ = response.send(Err(error.clone()));
             }
         }
     }
-}
-
-fn copy_io_error(error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), error.to_string())
 }
 
 /// Constructs the application router with all routes and the auth layer.
@@ -502,7 +498,7 @@ async fn get_key(State(state): State<AppState>, Path(key): Path<String>) -> Resp
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, "not found\n").into_response(),
         Ok(Err(error)) => {
             log_error!(TARGET, "get failed: {error}");
-            storage_error()
+            storage_error(&error)
         }
         Err(error) => dispatch_error(error),
     }
@@ -513,7 +509,7 @@ async fn put_key(State(state): State<AppState>, Path(key): Path<String>, body: B
         Ok(Ok(())) => (StatusCode::OK, "OK\n").into_response(),
         Ok(Err(error)) => {
             log_error!(TARGET, "set failed: {error}");
-            storage_error()
+            storage_error(&error)
         }
         Err(error) => dispatch_error(error),
     }
@@ -525,7 +521,7 @@ async fn delete_key(State(state): State<AppState>, Path(key): Path<String>) -> R
         Ok(Ok(false)) => (StatusCode::NOT_FOUND, "not found\n").into_response(),
         Ok(Err(error)) => {
             log_error!(TARGET, "delete failed: {error}");
-            storage_error()
+            storage_error(&error)
         }
         Err(error) => dispatch_error(error),
     }
@@ -566,12 +562,25 @@ fn dispatch_error(error: DispatchError) -> Response {
         DispatchError::Full => {
             (StatusCode::SERVICE_UNAVAILABLE, "storage queue full\n").into_response()
         }
-        DispatchError::Closed => storage_error(),
+        DispatchError::Closed => {
+            (StatusCode::SERVICE_UNAVAILABLE, "storage unavailable\n").into_response()
+        }
     }
 }
 
-fn storage_error() -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, "storage unavailable\n").into_response()
+fn storage_error(error: &StorageError) -> Response {
+    match error.kind() {
+        StorageErrorKind::InvalidInput => {
+            (StatusCode::BAD_REQUEST, "invalid storage input\n").into_response()
+        }
+        StorageErrorKind::Conflict => (StatusCode::CONFLICT, "storage conflict\n").into_response(),
+        StorageErrorKind::Unavailable | StorageErrorKind::Poisoned => {
+            (StatusCode::SERVICE_UNAVAILABLE, "storage unavailable\n").into_response()
+        }
+        StorageErrorKind::Corruption => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "storage corruption\n").into_response()
+        }
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

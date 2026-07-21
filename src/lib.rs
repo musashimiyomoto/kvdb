@@ -7,6 +7,7 @@
 //! The `kvdb-server` and `kvdb-client` binaries build on these modules.
 
 mod checksum;
+mod error;
 mod failpoint;
 
 pub mod http;
@@ -15,6 +16,7 @@ pub mod log;
 pub mod sstable;
 pub mod store;
 
+pub use error::{StorageError, StorageErrorKind, StorageResult};
 pub use http::{AppState, StorageMetrics, StorageOptions, router};
 pub use sstable::SsTableCacheMetrics;
 pub use store::{

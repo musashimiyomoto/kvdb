@@ -4,7 +4,7 @@ Last reviewed: 2026-07-21.
 
 kvdb has a working single-node LSM-style engine, baseline persistence
 hardening, and a reproducible end-to-end benchmark. The controlled performance
-rebaseline is complete; the current goal is structured storage errors and the
+rebaseline and structured storage errors are complete; the current goal is the
 remaining integrity work, while stable format versioning is intentionally
 deferred until production preparation and the worker GET regression remains an
 explicit follow-up.
@@ -246,8 +246,8 @@ compaction separately.
 - [x] Add failpoints around WAL write/sync, SSTable sync/rename, manifest
   sync/rename, WAL truncation, and obsolete-table deletion. Kill a child at
   each point and compare recovery with acknowledged operations.
-- Replace broad `io::Error` reporting with structured errors for invalid input,
-  corruption, unavailable I/O, conflict, and poisoned state.
+- [x] Replace broad `io::Error` reporting with structured errors for invalid
+  input, corruption, unavailable I/O, conflict, and poisoned state.
 - Document supported filesystem/rename assumptions and safe cleanup of
   temporary and orphan files.
 
