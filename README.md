@@ -208,13 +208,17 @@ Each SSTable key record contains its versions in ascending commit-sequence
 order. Tables group records into 64-entry blocks with a persisted **sparse
 index** (one first key, byte range, record count, and CRC32 per block) and a
 **Bloom filter**. The index and its footer offset have a separate CRC32, while
-the manifest ends with a checksum over its exact metadata bytes. Opening a
-table does not load every key into memory; a Bloom negative skips the file
-entirely, while a possible hit binary-searches the index and verifies one block
-before decoding it. Open files and decoded blocks share bounded LRU caches
-across all live tables in a Store. Compaction invalidates retired table entries
-before deleting their files; hit/miss/eviction/residency counters are available
-from `Store::sstable_cache_metrics()`.
+the manifest ends with a checksum over its exact metadata bytes. Manifest size,
+line length, and live-table count are bounded; names must be canonical and
+unique. SSTables persist their minimum/maximum commit sequence, allowing open
+to reject empty live tables, tables newer than the manifest, and overlapping or
+unordered table ranges. Opening a table does not load every key into memory; a
+Bloom negative skips the file entirely, while a possible hit binary-searches
+the index and verifies one block before decoding it. Open files and decoded
+blocks share bounded LRU caches across all live tables in a Store. Compaction
+invalidates retired table entries before deleting their files;
+hit/miss/eviction/residency counters are available from
+`Store::sstable_cache_metrics()`.
 
 Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the Store
 starts a streaming compaction thread. The k-way merge buffers one decoded

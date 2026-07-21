@@ -13,7 +13,7 @@
 //! ```text
 //!   ["KVDBSST"]
 //!   [record ...]                         data blocks (64 records each)
-//!   ["KVDBIDX"][block_count][record_count][Bloom filter]
+//!   ["KVDBIDX"][block_count][record_count][min_sequence][max_sequence][Bloom filter]
 //!     repeated: [first_key][start][end][records_in_block][block_crc32]
 //!   [index_offset:u64 BE][index_crc32]["KVDBEND"]
 //! ```
@@ -492,7 +492,17 @@ pub struct SsTable {
     blocks: Vec<BlockIndex>,
     bloom: BloomFilter,
     len: usize,
+    min_sequence: u64,
+    max_sequence: u64,
     cache: Arc<SsTableCache>,
+}
+
+struct IndexMetadata {
+    blocks: Vec<BlockIndex>,
+    bloom: BloomFilter,
+    records: usize,
+    min_sequence: u64,
+    max_sequence: u64,
 }
 
 impl SsTable {
@@ -530,6 +540,8 @@ impl SsTable {
         let mut record_count = 0usize;
         let mut version_count = 0u64;
         let mut block_checksum = Crc32::new();
+        let mut min_sequence = u64::MAX;
+        let mut max_sequence = 0u64;
 
         for entry in entries {
             let (key, versions) = entry?;
@@ -570,6 +582,8 @@ impl SsTable {
             blocks.last_mut().expect("a block was just created").records += 1;
             record_count += 1;
             version_count = version_count.saturating_add(versions.len() as u64);
+            min_sequence = min_sequence.min(versions[0].sequence);
+            max_sequence = max_sequence.max(versions[versions.len() - 1].sequence);
             bloom_hashes.push(key_hashes(&key));
             previous_key = Some(key);
         }
@@ -587,6 +601,8 @@ impl SsTable {
             },
             &blocks,
             record_count,
+            if record_count == 0 { 0 } else { min_sequence },
+            max_sequence,
             &BloomFilter::from_hashes(&bloom_hashes),
         )?;
         let index_offset_bytes = index_offset.to_be_bytes();
@@ -617,14 +633,16 @@ impl SsTable {
         if &magic != FILE_MAGIC {
             return Err(invalid_data("invalid SSTable file magic"));
         }
-        let (blocks, bloom, len) = read_index(&mut file)?;
+        let metadata = read_index(&mut file)?;
         cache.insert_open_file(path, file);
 
         Ok(SsTable {
             path: path.to_path_buf(),
-            blocks,
-            bloom,
-            len,
+            blocks: metadata.blocks,
+            bloom: metadata.bloom,
+            len: metadata.records,
+            min_sequence: metadata.min_sequence,
+            max_sequence: metadata.max_sequence,
             cache,
         })
     }
@@ -732,6 +750,10 @@ impl SsTable {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    pub(crate) fn sequence_bounds(&self) -> Option<(u64, u64)> {
+        (!self.is_empty()).then_some((self.min_sequence, self.max_sequence))
+    }
 }
 
 pub(crate) struct SsTableIter {
@@ -817,6 +839,8 @@ fn write_index<W: Write>(
     w: &mut W,
     blocks: &[BlockIndex],
     records: usize,
+    min_sequence: u64,
+    max_sequence: u64,
     bloom: &BloomFilter,
 ) -> io::Result<()> {
     let block_count =
@@ -829,6 +853,8 @@ fn write_index<W: Write>(
     w.write_all(INDEX_MAGIC)?;
     w.write_all(&block_count.to_be_bytes())?;
     w.write_all(&record_count.to_be_bytes())?;
+    w.write_all(&min_sequence.to_be_bytes())?;
+    w.write_all(&max_sequence.to_be_bytes())?;
     w.write_all(&[bloom.hashes])?;
     w.write_all(&bloom_len.to_be_bytes())?;
     w.write_all(&bloom.bits)?;
@@ -844,9 +870,10 @@ fn write_index<W: Write>(
     Ok(())
 }
 
-fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usize)> {
+fn read_index(file: &mut File) -> io::Result<IndexMetadata> {
     let file_len = file.metadata()?.len();
-    let minimum_len = FILE_MAGIC.len() as u64 + INDEX_MAGIC.len() as u64 + 4 + 8 + 5 + FOOTER_LEN;
+    let minimum_len =
+        FILE_MAGIC.len() as u64 + INDEX_MAGIC.len() as u64 + 4 + 8 + 8 + 8 + 5 + FOOTER_LEN;
     if file_len < minimum_len {
         return Err(invalid_data(
             "SSTable is too short for its header and index",
@@ -883,6 +910,8 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
     let block_count = read_u32(&mut reader)? as usize;
     let record_count = usize::try_from(read_u64(&mut reader)?)
         .map_err(|_| invalid_data("SSTable record count is too large"))?;
+    let min_sequence = read_u64(&mut reader)?;
+    let max_sequence = read_u64(&mut reader)?;
     let hashes = read_u8(&mut reader)?;
     let bloom_len = u64::from(read_u32(&mut reader)?);
     if hashes == 0
@@ -925,16 +954,41 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
     if index_checksum.finish() != stored_index_checksum {
         return Err(invalid_data("SSTable index checksum mismatch"));
     }
-    validate_index(&blocks, record_count, index_offset)?;
-    Ok((blocks, bloom, record_count))
+    validate_index(
+        &blocks,
+        record_count,
+        min_sequence,
+        max_sequence,
+        index_offset,
+    )?;
+    Ok(IndexMetadata {
+        blocks,
+        bloom,
+        records: record_count,
+        min_sequence,
+        max_sequence,
+    })
 }
 
-fn validate_index(blocks: &[BlockIndex], record_count: usize, index_offset: u64) -> io::Result<()> {
+fn validate_index(
+    blocks: &[BlockIndex],
+    record_count: usize,
+    min_sequence: u64,
+    max_sequence: u64,
+    index_offset: u64,
+) -> io::Result<()> {
     if blocks.is_empty() {
-        if record_count != 0 || index_offset != FILE_MAGIC.len() as u64 {
+        if record_count != 0
+            || min_sequence != 0
+            || max_sequence != 0
+            || index_offset != FILE_MAGIC.len() as u64
+        {
             return Err(invalid_data("empty SSTable has an inconsistent index"));
         }
         return Ok(());
+    }
+    if record_count == 0 || min_sequence == 0 || max_sequence < min_sequence {
+        return Err(invalid_data("SSTable sequence bounds are invalid"));
     }
     if blocks[0].start != FILE_MAGIC.len() as u64 {
         return Err(invalid_data("first SSTable block has an invalid offset"));

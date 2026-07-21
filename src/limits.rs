@@ -12,3 +12,6 @@ pub(crate) const MAX_VERSIONS_PER_KEY: usize = 65_536;
 pub(crate) const MAX_SSTABLE_RECORD_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_BLOOM_FILTER_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_BLOOM_HASHES: u8 = 32;
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_MANIFEST_LINE_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_MANIFEST_SSTABLES: usize = 10_000;

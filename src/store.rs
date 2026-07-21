@@ -24,7 +24,10 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::checksum::{Crc32, crc32};
-use crate::limits::{MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES};
+use crate::limits::{
+    MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_LINE_BYTES,
+    MAX_MANIFEST_SSTABLES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES,
+};
 use crate::sstable::{
     SsTable, SsTableCache, SsTableCacheMetrics, SsTableIter, Value, VersionedValue,
 };
@@ -332,14 +335,29 @@ impl Store {
         let dir = parent_dir(&wal_path);
         let sstable_cache = SsTableCache::from_env();
         let mut sstables = Vec::with_capacity(sstable_names.len());
+        let mut previous_table_max = None;
         for name in &sstable_names {
             let table = SsTable::open_with_cache(&dir.join(name), Arc::clone(&sstable_cache))?;
+            let (min_sequence, max_sequence) = table
+                .sequence_bounds()
+                .ok_or_else(|| invalid_data(format!("live SSTable {name} must not be empty")))?;
+            if max_sequence > manifest.sequence {
+                return Err(invalid_data(format!(
+                    "SSTable {name} is newer than the manifest sequence"
+                )));
+            }
+            if previous_table_max.is_some_and(|previous| previous >= min_sequence) {
+                return Err(invalid_data(
+                    "manifest SSTables have overlapping or unordered sequence ranges",
+                ));
+            }
+            previous_table_max = Some(max_sequence);
             sstables.push(LiveSsTable {
                 name: name.clone(),
                 table,
             });
         }
-        let next_seq = next_seq_from(&sstable_names);
+        let next_seq = next_seq_from(&manifest_path, &sstable_names)?;
 
         // 2. Replay the WAL (writes since the last flush) on top of the SSTables.
         let replay = Self::replay(&wal_path, manifest.sequence)?;
@@ -706,6 +724,10 @@ impl Store {
 
         let dir = parent_dir(&self.wal_path);
         let name = sstable_name(&self.wal_path, self.next_seq);
+        let following_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("SSTable generation sequence exhausted"))?;
         let sst_path = dir.join(&name);
 
         // 1. Write the sorted memtable to a fresh SSTable, durably.
@@ -736,7 +758,7 @@ impl Store {
             name: name.clone(),
             table: SsTable::open_with_cache(&sst_path, Arc::clone(&self.sstable_cache))?,
         });
-        self.next_seq += 1;
+        self.next_seq = following_seq;
         self.memtable.clear();
         self.memtable_bytes = 0;
         self.memtable_versions = 0;
@@ -886,17 +908,21 @@ impl Store {
             None
         } else {
             let name = sstable_name(&self.wal_path, self.next_seq);
+            let following_seq = self
+                .next_seq
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("SSTable generation sequence exhausted"))?;
             let path = dir.join(&name);
             std::fs::rename(&build.working_path, &path)?;
             sync_parent_directory(&path)?;
             let table = SsTable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
-            Some(LiveSsTable { name, table })
+            Some((LiveSsTable { name, table }, following_seq))
         };
 
         let mut names = Vec::with_capacity(
             usize::from(replacement.is_some()) + self.sstables.len() - target_names.len(),
         );
-        if let Some(table) = &replacement {
+        if let Some((table, _)) = &replacement {
             names.push(table.name.clone());
         }
         names.extend(
@@ -911,12 +937,15 @@ impl Store {
             &names,
         )?;
 
-        let wrote_replacement = replacement.is_some();
+        let following_seq = replacement
+            .as_ref()
+            .map(|(_, following_seq)| *following_seq);
         let suffix = self.sstables.split_off(target_names.len());
+        let replacement = replacement.map(|(table, _)| table);
         let retired = std::mem::replace(&mut self.sstables, replacement.into_iter().collect());
         self.sstables.extend(suffix);
-        if wrote_replacement {
-            self.next_seq = self.next_seq.saturating_add(1);
+        if let Some(following_seq) = following_seq {
+            self.next_seq = following_seq;
         }
         for old in retired {
             let old_path = dir.join(&old.name);
@@ -1011,6 +1040,10 @@ impl Store {
         let manifest = manifest_path(&self.wal_path);
 
         let name = sstable_name(&self.wal_path, self.next_seq);
+        let following_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("SSTable generation sequence exhausted"))?;
         let path = dir.join(&name);
         let mut merged = StreamingMerge::new(&self.sstables, history_start)?;
         let write_stats = SsTable::write_stream(&path, &mut merged)?;
@@ -1051,7 +1084,7 @@ impl Store {
         self.sstables = replacement.into_iter().collect();
         self.history_start = history_start;
         if !self.sstables.is_empty() {
-            self.next_seq += 1;
+            self.next_seq = following_seq;
         }
 
         log_info!(
@@ -1523,23 +1556,39 @@ fn lock_path(wal_path: &Path) -> PathBuf {
 
 /// The SSTable file name for a sequence number, e.g. `kvdb-000007.sst`.
 fn sstable_name(wal_path: &Path, seq: u64) -> String {
-    format!("{}-{seq:06}.sst", stem(wal_path))
+    sstable_name_for_stem(&stem(wal_path), seq)
 }
 
 /// Next sequence number = one past the highest seq encoded in existing names.
-fn next_seq_from(names: &[String]) -> u64 {
-    names
+fn next_seq_from(manifest_path: &Path, names: &[String]) -> io::Result<u64> {
+    let max = names
         .iter()
-        .filter_map(|n| seq_of(n))
+        .filter_map(|name| sstable_generation(manifest_path, name))
         .max()
-        .map(|m| m + 1)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    if names.is_empty() {
+        Ok(0)
+    } else {
+        max.checked_add(1)
+            .ok_or_else(|| invalid_data("SSTable generation sequence is exhausted"))
+    }
 }
 
-/// Extracts the sequence number from a `<stem>-NNNNNN.sst` file name.
-fn seq_of(name: &str) -> Option<u64> {
-    let digits = name.rsplit_once('-')?.1.strip_suffix(".sst")?;
-    digits.parse().ok()
+fn sstable_name_for_stem(stem: &str, sequence: u64) -> String {
+    format!("{stem}-{sequence:06}.sst")
+}
+
+/// Extracts a canonical generation from `<manifest-stem>-NNNNNN.sst`.
+fn sstable_generation(manifest_path: &Path, name: &str) -> Option<u64> {
+    let manifest_stem = stem(manifest_path);
+    let digits = name
+        .strip_prefix(&format!("{manifest_stem}-"))?
+        .strip_suffix(".sst")?;
+    if digits.len() < 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence = digits.parse().ok()?;
+    (sstable_name_for_stem(&manifest_stem, sequence) == name).then_some(sequence)
 }
 
 // ---- Manifest --------------------------------------------------------------
@@ -1559,6 +1608,9 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Manifest::default()),
         Err(e) => return Err(e),
     };
+    if file.metadata()?.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid_data("manifest exceeds size limit"));
+    }
     let mut manifest = Manifest::default();
     let mut saw_sequence = false;
     let mut saw_history_start = false;
@@ -1568,16 +1620,28 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
     let mut raw_line = Vec::new();
     loop {
         raw_line.clear();
-        if reader.read_until(b'\n', &mut raw_line)? == 0 {
+        let bytes_read = (&mut reader)
+            .take((MAX_MANIFEST_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut raw_line)?;
+        if bytes_read == 0 {
             break;
+        }
+        if bytes_read > MAX_MANIFEST_LINE_BYTES {
+            return Err(invalid_data("manifest line exceeds size limit"));
         }
         if saw_checksum {
             return Err(invalid_data("manifest checksum must be the final line"));
         }
-        let line = std::str::from_utf8(&raw_line)
+        let encoded_line = std::str::from_utf8(&raw_line)
             .map_err(|_| invalid_data("manifest is not valid UTF-8"))?;
-        let trimmed = line.trim();
-        if let Some(encoded_checksum) = trimmed.strip_prefix("checksum=") {
+        let line = encoded_line.strip_suffix('\n').unwrap_or(encoded_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim() != line {
+            return Err(invalid_data(
+                "manifest line contains surrounding whitespace",
+            ));
+        }
+        if let Some(encoded_checksum) = line.strip_prefix("checksum=") {
             if encoded_checksum.len() != 8 {
                 return Err(invalid_data("invalid manifest checksum"));
             }
@@ -1590,25 +1654,25 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
             continue;
         }
         checksum.update(&raw_line);
-        if trimmed.is_empty() {
+        if line.is_empty() {
             continue;
         }
-        if let Some(raw_sequence) = trimmed.strip_prefix("sequence=") {
-            if saw_sequence {
+        if let Some(raw_sequence) = line.strip_prefix("sequence=") {
+            if saw_sequence || saw_history_start || !manifest.sstables.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "manifest contains more than one sequence",
+                    "manifest sequence metadata is duplicated or out of order",
                 ));
             }
             manifest.sequence = raw_sequence.parse().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid manifest sequence")
             })?;
             saw_sequence = true;
-        } else if let Some(raw_history_start) = trimmed.strip_prefix("history_start=") {
-            if saw_history_start {
+        } else if let Some(raw_history_start) = line.strip_prefix("history_start=") {
+            if !saw_sequence || saw_history_start || !manifest.sstables.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "manifest contains more than one history boundary",
+                    "manifest history metadata is duplicated or out of order",
                 ));
             }
             manifest.history_start = raw_history_start.parse().map_err(|_| {
@@ -1619,7 +1683,13 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
             })?;
             saw_history_start = true;
         } else {
-            manifest.sstables.push(trimmed.to_string());
+            if !saw_sequence || !saw_history_start {
+                return Err(invalid_data("manifest SSTable names precede metadata"));
+            }
+            if manifest.sstables.len() >= MAX_MANIFEST_SSTABLES {
+                return Err(invalid_data("manifest SSTable count exceeds limit"));
+            }
+            manifest.sstables.push(line.to_string());
         }
     }
     if !saw_checksum {
@@ -1643,7 +1713,40 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
             "manifest history boundary is newer than its sequence",
         ));
     }
+    validate_manifest_names(path, &manifest.sstables, io::ErrorKind::InvalidData)?;
     Ok(manifest)
+}
+
+fn validate_manifest_names(
+    manifest_path: &Path,
+    names: &[String],
+    kind: io::ErrorKind,
+) -> io::Result<()> {
+    if names.len() > MAX_MANIFEST_SSTABLES {
+        return Err(io::Error::new(kind, "manifest SSTable count exceeds limit"));
+    }
+    let mut unique_names = BTreeSet::new();
+    let mut unique_generations = BTreeSet::new();
+    for name in names {
+        if name.len() + 1 > MAX_MANIFEST_LINE_BYTES {
+            return Err(io::Error::new(kind, "manifest line exceeds size limit"));
+        }
+        let generation = sstable_generation(manifest_path, name)
+            .ok_or_else(|| io::Error::new(kind, "manifest contains an invalid SSTable name"))?;
+        if !unique_names.insert(name) {
+            return Err(io::Error::new(
+                kind,
+                "manifest contains a duplicate SSTable name",
+            ));
+        }
+        if !unique_generations.insert(generation) {
+            return Err(io::Error::new(
+                kind,
+                "manifest contains a duplicate SSTable generation",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Writes the manifest atomically (temp file + fsync + rename) so a crash never
@@ -1654,6 +1757,24 @@ fn write_manifest(
     history_start: u64,
     names: &[String],
 ) -> io::Result<()> {
+    if history_start > sequence {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "manifest history boundary is newer than its sequence",
+        ));
+    }
+    validate_manifest_names(path, names, io::ErrorKind::InvalidInput)?;
+    let manifest_bytes = names.iter().try_fold(128u64, |bytes, name| {
+        bytes
+            .checked_add(name.len() as u64 + 1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "manifest is too large"))
+    })?;
+    if manifest_bytes > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "manifest exceeds size limit",
+        ));
+    }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

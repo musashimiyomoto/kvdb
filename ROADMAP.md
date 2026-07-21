@@ -136,7 +136,8 @@ it.
 - **R4 - bounded mutable state:** key, byte, version, and WAL-byte limits can
   independently trigger a flush; transaction conflict tracking is bounded.
 - **R5 - bounded codecs:** public writes and WAL/SSTable decoders enforce key,
-  value, batch, version, record, index, and Bloom limits before allocation.
+  value, batch, version, record, index, Bloom, and manifest limits before
+  allocation.
 - **R6 - single writer:** an advisory lifetime lock rejects a second writable
   `Store` for the same WAL.
 - **R12 - reproducible build:** local, CI, and Docker builds use Rust 1.96.0
@@ -238,7 +239,7 @@ compaction separately.
   first production release.
 - [x] Add per-block SSTable checksums, a checksummed sparse index, and
   checksummed manifest metadata.
-- Bound manifest line/count parsing and validate filenames, duplicate entries,
+- [x] Bound manifest line/count parsing and validate filenames, duplicate entries,
   table ordering, sequence bounds, and table metadata during open.
 - Add failpoints around WAL write/sync, SSTable sync/rename, manifest
   sync/rename, WAL truncation, and obsolete-table deletion. Kill a child at

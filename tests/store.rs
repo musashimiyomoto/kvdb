@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use kvdb::limits::MAX_KEY_BYTES;
+use kvdb::sstable::{SsTable, VersionedValue};
 use kvdb::store::{Durability, Store, TransactionError, WriteBatch};
 
 /// Returns a fresh, unique temp WAL path and removes any leftover from a
@@ -43,6 +44,18 @@ fn checksummed_manifest(body: &[u8]) -> Vec<u8> {
     let mut bytes = body.to_vec();
     bytes.extend_from_slice(format!("checksum={:08x}\n", crc32(&[body])).as_bytes());
     bytes
+}
+
+fn rewrite_manifest(path: &std::path::Path, mutate: impl FnOnce(&mut Vec<String>)) {
+    let contents = std::fs::read_to_string(path).unwrap();
+    let mut lines = contents
+        .lines()
+        .filter(|line| !line.starts_with("checksum="))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    mutate(&mut lines);
+    let body = format!("{}\n", lines.join("\n"));
+    std::fs::write(path, checksummed_manifest(body.as_bytes())).unwrap();
 }
 
 #[test]
@@ -1061,6 +1074,143 @@ fn manifest_checksum_corruption_is_rejected() {
     };
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("checksum mismatch"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_rejects_oversized_lines_before_unbounded_allocation() {
+    let dir = tmp_dir("manifest-line-limit");
+    let wal = dir.join("kvdb.wal");
+    let mut body = b"sequence=0\nhistory_start=0\n".to_vec();
+    body.extend(std::iter::repeat_n(b'x', 5 * 1024));
+    body.push(b'\n');
+    std::fs::write(dir.join("kvdb.manifest"), checksummed_manifest(&body)).unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected oversized manifest line to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("line exceeds size limit"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_rejects_excessive_sstable_count() {
+    let dir = tmp_dir("manifest-table-limit");
+    let wal = dir.join("kvdb.wal");
+    let mut body = b"sequence=0\nhistory_start=0\n".to_vec();
+    for generation in 0..=10_000 {
+        body.extend_from_slice(format!("kvdb-{generation:06}.sst\n").as_bytes());
+    }
+    std::fs::write(dir.join("kvdb.manifest"), checksummed_manifest(&body)).unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected excessive manifest table count to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("count exceeds limit"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_rejects_noncanonical_and_duplicate_sstable_names() {
+    for (tag, names, expected) in [
+        ("bad-name", vec!["../outside.sst"], "invalid SSTable name"),
+        (
+            "duplicate-name",
+            vec!["kvdb-000000.sst", "kvdb-000000.sst"],
+            "duplicate SSTable name",
+        ),
+    ] {
+        let dir = tmp_dir(tag);
+        let wal = dir.join("kvdb.wal");
+        let body = format!("sequence=1\nhistory_start=0\n{}\n", names.join("\n"));
+        std::fs::write(
+            dir.join("kvdb.manifest"),
+            checksummed_manifest(body.as_bytes()),
+        )
+        .unwrap();
+
+        let error = match Store::open(&wal) {
+            Ok(_) => panic!("expected malformed manifest names to fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(expected));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn manifest_rejects_unordered_sstable_sequence_ranges() {
+    let dir = tmp_dir("manifest-table-order");
+    let wal = dir.join("kvdb.wal");
+    {
+        let mut store = Store::open(&wal).unwrap();
+        store.set_compaction_threshold(0);
+        store.set(b"first".to_vec(), b"one".to_vec()).unwrap();
+        store.flush().unwrap();
+        store.set(b"second".to_vec(), b"two".to_vec()).unwrap();
+        store.flush().unwrap();
+    }
+    rewrite_manifest(&dir.join("kvdb.manifest"), |lines| {
+        lines.swap(2, 3);
+    });
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected unordered SSTable sequence ranges to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("unordered sequence ranges"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_rejects_sstable_newer_than_durable_sequence() {
+    let dir = tmp_dir("manifest-table-sequence");
+    let wal = dir.join("kvdb.wal");
+    {
+        let mut store = Store::open(&wal).unwrap();
+        store.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+        store.flush().unwrap();
+    }
+    rewrite_manifest(&dir.join("kvdb.manifest"), |lines| {
+        lines[0] = "sequence=0".to_string();
+    });
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected newer SSTable metadata to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("newer than the manifest"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_rejects_empty_live_sstable_metadata() {
+    let dir = tmp_dir("manifest-empty-table");
+    let wal = dir.join("kvdb.wal");
+    SsTable::write(
+        &dir.join("kvdb-000000.sst"),
+        std::iter::empty::<(&[u8], &[VersionedValue])>(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("kvdb.manifest"),
+        checksummed_manifest(b"sequence=0\nhistory_start=0\nkvdb-000000.sst\n"),
+    )
+    .unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected empty live SSTable to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("must not be empty"));
     std::fs::remove_dir_all(&dir).ok();
 }
 
