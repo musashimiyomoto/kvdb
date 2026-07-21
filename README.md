@@ -30,9 +30,14 @@ tests/
 **Durability guarantee:** by default every mutation is appended to the WAL,
 flushed, and synchronized with `sync_data` before it is applied to the memtable
 or acknowledged. A trailing record left torn by a crash is treated as
-uncommitted and dropped during recovery. `KVDB_DURABILITY=buffered` is an
-explicit performance mode that flushes only to the operating system and can
-lose acknowledged writes after an OS crash or power loss.
+uncommitted and physically removed during recovery; checksum failures and
+malformed complete records are rejected as corruption. WAL records use
+independently versioned `KVW2` frames containing a bounded payload length and
+CRC32 over the version, encoded length, and payload. Existing unframed WALs are
+validated and atomically migrated through a synced temporary file on first
+open. `KVDB_DURABILITY=buffered` is an explicit performance mode that flushes
+only to the operating system and can lose acknowledged writes after an OS crash
+or power loss.
 
 HTTP storage operations run on one dedicated blocking worker behind a bounded
 FIFO queue. Adjacent writes are committed as separate logical WAL records and
@@ -335,9 +340,10 @@ memtables, indexed and Bloom-filtered SSTables, atomic batches, snapshots,
 optimistic transactions, MVCC retention, compaction, HTTP access, load tests,
 and a local performance baseline are implemented.
 
-The first persistence-hardening pass is complete: durable mode calls
-`sync_data`, recovery allocations are bounded, storage read failures propagate,
-memory/WAL flush limits are enforced, and a second writer is rejected. The
-benchmark-driven performance pass is active: bounded worker/group commit,
-SSTable caching, and background streaming compaction are in place. See the
+The persistence-hardening work now includes versioned, length-delimited,
+checksummed WAL frames, automatic legacy migration, torn-tail repair, bounded
+recovery allocations, propagated storage failures, memory/WAL flush limits,
+and single-writer enforcement. SSTable/manifest checksums and crash failpoints
+remain. The benchmark-driven performance pass has bounded worker/group commit,
+SSTable caching, and background streaming compaction in place. See the
 [prioritized roadmap](ROADMAP.md) for current status and acceptance criteria.

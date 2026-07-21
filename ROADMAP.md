@@ -123,6 +123,8 @@ it.
    detailed worker/cache instrumentation, and record
    the before/after baseline.
 5. Add versioned checksummed WAL/SSTable/manifest formats and crash failpoints.
+   WAL framing, checksums, torn-tail repair, and legacy migration are complete;
+   SSTable/manifest checksums and the crash matrix remain.
 6. Continue service lifecycle, API contract, delivery, and operations work.
 
 ## Completed hardening
@@ -149,8 +151,8 @@ SSTable or manifest fsyncs its parent directory on Unix.
 
 | ID | Severity | Status | Remaining risk |
 |---|---|---|---|
-| R2 | P0 | Partial | WAL records are not versioned, length-delimited frames and have no checksum or complete crash-point coverage. |
-| R7 | P0 | Partial | WAL records, SSTable blocks, and manifest metadata lack checksums and a documented migration path. |
+| R2 | P0 | Partial | WAL records are versioned, length-delimited, and checksummed, but complete crash-point coverage remains. |
+| R7 | P0 | Partial | WAL migration is automatic and documented; SSTable blocks and manifest metadata still lack checksums and migration coverage. |
 | R8 | P1 | Partial | A bounded worker and group commit replace the request-path mutex; cancellation and graceful worker shutdown remain, and standard TCP GET throughput regresses 28-76% depending on concurrency. |
 | R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` although reqwest has no TLS. |
 | R10 | P1 | Open | One-shot client commands print HTTP errors but exit successfully, and values are decoded as text. |
@@ -231,7 +233,7 @@ compaction separately.
 
 ## Milestone 1: integrity and crash hardening
 
-- Introduce a versioned, length-delimited WAL frame with a checksum and an
+- [x] Introduce a versioned, length-delimited WAL frame with a checksum and an
   explicit migration path from the current format.
 - Add per-block SSTable checksums and checksummed manifest metadata.
 - Bound manifest line/count parsing and validate filenames, duplicate entries,
