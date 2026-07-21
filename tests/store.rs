@@ -39,6 +39,12 @@ fn crc32(parts: &[&[u8]]) -> u32 {
     !crc
 }
 
+fn checksummed_manifest(body: &[u8]) -> Vec<u8> {
+    let mut bytes = body.to_vec();
+    bytes.extend_from_slice(format!("checksum={:08x}\n", crc32(&[body])).as_bytes());
+    bytes
+}
+
 #[test]
 fn set_get_delete() {
     let path = tmp_path("basic");
@@ -1015,7 +1021,11 @@ fn transaction_conflicts_when_a_read_value_changes_and_changes_back() {
 fn manifest_rejects_history_boundary_newer_than_durable_sequence() {
     let dir = tmp_dir("bad-history-boundary");
     let wal = dir.join("kvdb.wal");
-    std::fs::write(dir.join("kvdb.manifest"), b"sequence=4\nhistory_start=5\n").unwrap();
+    std::fs::write(
+        dir.join("kvdb.manifest"),
+        checksummed_manifest(b"sequence=4\nhistory_start=5\n"),
+    )
+    .unwrap();
 
     let error = match Store::open(&wal) {
         Ok(_) => panic!("expected invalid history boundary to fail"),
@@ -1023,6 +1033,34 @@ fn manifest_rejects_history_boundary_newer_than_durable_sequence() {
     };
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_checksum_corruption_is_rejected() {
+    let dir = tmp_dir("manifest-checksum");
+    let wal = dir.join("kvdb.wal");
+    {
+        let mut store = Store::open(&wal).unwrap();
+        store.set(b"key".to_vec(), b"value".to_vec()).unwrap();
+        store.flush().unwrap();
+    }
+
+    let manifest = dir.join("kvdb.manifest");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    let sequence = bytes
+        .windows(b"sequence=1".len())
+        .position(|window| window == b"sequence=1")
+        .unwrap();
+    bytes[sequence + b"sequence=".len()] = b'2';
+    std::fs::write(&manifest, bytes).unwrap();
+
+    let error = match Store::open(&wal) {
+        Ok(_) => panic!("expected manifest checksum corruption to fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("checksum mismatch"));
     std::fs::remove_dir_all(&dir).ok();
 }
 

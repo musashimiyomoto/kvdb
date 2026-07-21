@@ -6,6 +6,8 @@
 //!
 //! The `kvdb-server` and `kvdb-client` binaries build on these modules.
 
+mod checksum;
+
 pub mod http;
 pub mod limits;
 pub mod log;

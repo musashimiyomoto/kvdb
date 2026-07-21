@@ -1,6 +1,6 @@
 # kvdb roadmap
 
-Last reviewed: 2026-07-20.
+Last reviewed: 2026-07-21.
 
 kvdb has a working single-node LSM-style engine, baseline persistence
 hardening, and a reproducible end-to-end benchmark. The controlled performance
@@ -123,8 +123,8 @@ it.
    detailed worker/cache instrumentation, and record
    the before/after baseline.
 5. Add versioned checksummed WAL/SSTable/manifest formats and crash failpoints.
-   Pre-release WAL framing, checksums, and torn-tail repair are complete;
-   stable versioning, SSTable/manifest checksums, and the crash matrix remain.
+   Pre-release WAL/SSTable/manifest checksums and torn-tail repair are complete;
+   stable versioning and the crash matrix remain.
 6. Continue service lifecycle, API contract, delivery, and operations work.
 
 ## Completed hardening
@@ -152,7 +152,7 @@ SSTable or manifest fsyncs its parent directory on Unix.
 | ID | Severity | Status | Remaining risk |
 |---|---|---|---|
 | R2 | P0 | Partial | WAL records are length-delimited and checksummed, but stable format versioning and complete crash-point coverage remain. |
-| R7 | P0 | Partial | WAL checksums exist; production migration policy plus SSTable-block and manifest checksums remain. |
+| R7 | P0 | Partial | WAL, SSTable blocks/index, and manifest metadata are checksummed; stable production versions and migration policy remain. |
 | R8 | P1 | Partial | A bounded worker and group commit replace the request-path mutex; cancellation and graceful worker shutdown remain, and standard TCP GET throughput regresses 28-76% depending on concurrency. |
 | R9 | P1 | Open | Basic credentials travel over plain HTTP; the client recognizes `https://` although reqwest has no TLS. |
 | R10 | P1 | Open | One-shot client commands print HTTP errors but exit successfully, and values are decoded as text. |
@@ -236,7 +236,8 @@ compaction separately.
 - [x] Introduce a length-delimited pre-release WAL frame with a checksum.
 - Establish stable WAL versioning and an explicit migration policy before the
   first production release.
-- Add per-block SSTable checksums and checksummed manifest metadata.
+- [x] Add per-block SSTable checksums, a checksummed sparse index, and
+  checksummed manifest metadata.
 - Bound manifest line/count parsing and validate filenames, duplicate entries,
   table ordering, sequence bounds, and table metadata during open.
 - Add failpoints around WAL write/sync, SSTable sync/rename, manifest

@@ -206,13 +206,15 @@ output attribute request latency to queueing versus storage work.
 After a successful flush, the manifest is updated and the WAL is truncated.
 Each SSTable key record contains its versions in ascending commit-sequence
 order. Tables group records into 64-entry blocks with a persisted **sparse
-index** (one first key and byte range per block) and a **Bloom filter**.
-Opening a table does not load every key into memory; a Bloom negative skips the
-file entirely, while a possible hit binary-searches the index and searches one
-decoded block. Open files and decoded blocks share bounded LRU caches across
-all live tables in a Store. Compaction invalidates retired table entries before
-deleting their files; hit/miss/eviction/residency counters are available from
-`Store::sstable_cache_metrics()`.
+index** (one first key, byte range, record count, and CRC32 per block) and a
+**Bloom filter**. The index and its footer offset have a separate CRC32, while
+the manifest ends with a checksum over its exact metadata bytes. Opening a
+table does not load every key into memory; a Bloom negative skips the file
+entirely, while a possible hit binary-searches the index and verifies one block
+before decoding it. Open files and decoded blocks share bounded LRU caches
+across all live tables in a Store. Compaction invalidates retired table entries
+before deleting their files; hit/miss/eviction/residency counters are available
+from `Store::sstable_cache_metrics()`.
 
 Once `KVDB_COMPACTION_THRESHOLD` SSTables accumulate (default `8`), the Store
 starts a streaming compaction thread. The k-way merge buffers one decoded
@@ -341,9 +343,10 @@ optimistic transactions, MVCC retention, compaction, HTTP access, load tests,
 and a local performance baseline are implemented.
 
 The persistence-hardening work now includes length-delimited, checksummed WAL
-frames, torn-tail repair, bounded recovery allocations, propagated storage
-failures, memory/WAL flush limits, and single-writer enforcement. Stable format
-versioning, SSTable/manifest checksums, and crash failpoints remain. The
-benchmark-driven performance pass has bounded worker/group commit, SSTable
-caching, and background streaming compaction in place. See the [prioritized
-roadmap](ROADMAP.md) for current status and acceptance criteria.
+frames, per-block and index SSTable checksums, checksummed manifest metadata,
+torn-tail repair, bounded recovery allocations, propagated storage failures,
+memory/WAL flush limits, and single-writer enforcement. Stable format
+versioning and crash failpoints remain. The benchmark-driven performance pass
+has bounded worker/group commit, SSTable caching, and background streaming
+compaction in place. See the [prioritized roadmap](ROADMAP.md) for current
+status and acceptance criteria.

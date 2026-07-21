@@ -7,15 +7,15 @@
 //!
 //! ## On-disk format
 //!
-//! Version 1 tables contain a short header, a flat sequence of sorted records,
-//! a sparse block index with a Bloom filter, and a fixed-size footer:
+//! Pre-release tables contain a short header, checksummed data blocks, a
+//! checksummed sparse index with a Bloom filter, and a fixed-size footer:
 //!
 //! ```text
-//!   ["KVDBSST1"]
+//!   ["KVDBSST"]
 //!   [record ...]                         data blocks (64 records each)
-//!   ["KVDBIDX1"][block_count][record_count][Bloom filter]
-//!     repeated: [first_key][start][end][records_in_block]
-//!   [index_offset:u64 BE]["KVDBEND1"]
+//!   ["KVDBIDX"][block_count][record_count][Bloom filter]
+//!     repeated: [first_key][start][end][records_in_block][block_crc32]
+//!   [index_offset:u64 BE][index_crc32]["KVDBEND"]
 //! ```
 //!
 //! Each record is encoded as one key plus its versions in ascending sequence:
@@ -31,7 +31,6 @@
 //! 64-record block. Opening a table reads only its footer and index; record keys
 //! are not all retained in memory.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -39,6 +38,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::checksum::{Crc32, crc32};
 use crate::limits::{
     MAX_BLOOM_FILTER_BYTES, MAX_BLOOM_HASHES, MAX_KEY_BYTES, MAX_SSTABLE_RECORD_BYTES,
     MAX_VALUE_BYTES, MAX_VERSIONS_PER_KEY,
@@ -48,10 +48,10 @@ use crate::limits::{
 const FLAG_SET: u8 = 0;
 const FLAG_TOMBSTONE: u8 = 1;
 
-const FILE_MAGIC: &[u8; 8] = b"KVDBSST1";
-const INDEX_MAGIC: &[u8; 8] = b"KVDBIDX1";
-const FOOTER_MAGIC: &[u8; 8] = b"KVDBEND1";
-const FOOTER_LEN: u64 = 16;
+const FILE_MAGIC: &[u8; 7] = b"KVDBSST";
+const INDEX_MAGIC: &[u8; 7] = b"KVDBIDX";
+const FOOTER_MAGIC: &[u8; 7] = b"KVDBEND";
+const FOOTER_LEN: u64 = 19;
 
 /// Number of sorted records covered by one sparse-index entry.
 const RECORDS_PER_BLOCK: usize = 64;
@@ -62,6 +62,48 @@ const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 type BlockEntries = Vec<(Vec<u8>, Vec<VersionedValue>)>;
 type SharedBlockEntries = Arc<BlockEntries>;
+
+struct ChecksummedWriter<'a, W> {
+    inner: &'a mut W,
+    checksum: &'a mut Crc32,
+}
+
+impl<W: Write> Write for ChecksummedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.checksum.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ChecksummedReader<'a, R> {
+    inner: R,
+    checksum: &'a mut Crc32,
+}
+
+impl<R> ChecksummedReader<'_, R> {
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for ChecksummedReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(bytes)?;
+        self.checksum.update(&bytes[..read]);
+        Ok(read)
+    }
+}
+
+impl<R: Read> ChecksummedReader<'_, std::io::Take<R>> {
+    fn limit(&self) -> u64 {
+        self.inner.limit()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SsTableWriteStats {
@@ -382,12 +424,13 @@ impl SsTableCacheInner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BlockIndex {
     first_key: Vec<u8>,
     start: u64,
     end: u64,
     records: usize,
+    checksum: u32,
 }
 
 #[derive(Debug)]
@@ -453,7 +496,7 @@ pub struct SsTable {
 }
 
 impl SsTable {
-    /// Writes sorted `entries` to a version 1 SSTable at `path`, atomically.
+    /// Writes sorted `entries` to a pre-release SSTable at `path`, atomically.
     /// The data and sparse index are streamed to a temp file, fsynced, and
     /// renamed into place, so a crash never leaves a half-written `path`.
     pub fn write<'a, I>(path: &Path, entries: I) -> io::Result<()>
@@ -486,6 +529,7 @@ impl SsTable {
         let mut offset = FILE_MAGIC.len() as u64;
         let mut record_count = 0usize;
         let mut version_count = 0u64;
+        let mut block_checksum = Crc32::new();
 
         for entry in entries {
             let (key, versions) = entry?;
@@ -500,16 +544,26 @@ impl SsTable {
             if record_count.is_multiple_of(RECORDS_PER_BLOCK) {
                 if let Some(previous) = blocks.last_mut() {
                     previous.end = offset;
+                    previous.checksum = block_checksum.finish();
                 }
+                block_checksum = Crc32::new();
                 blocks.push(BlockIndex {
                     first_key: key.clone(),
                     start: offset,
                     end: 0,
                     records: 0,
+                    checksum: 0,
                 });
             }
 
-            write_record(&mut w, &key, &versions)?;
+            write_record(
+                &mut ChecksummedWriter {
+                    inner: &mut w,
+                    checksum: &mut block_checksum,
+                },
+                &key,
+                &versions,
+            )?;
             offset = offset
                 .checked_add(encoded_record_len(&key, &versions)?)
                 .ok_or_else(|| invalid_input("SSTable is too large"))?;
@@ -523,14 +577,22 @@ impl SsTable {
         let index_offset = offset;
         if let Some(last) = blocks.last_mut() {
             last.end = index_offset;
+            last.checksum = block_checksum.finish();
         }
+        let mut index_checksum = Crc32::new();
         write_index(
-            &mut w,
+            &mut ChecksummedWriter {
+                inner: &mut w,
+                checksum: &mut index_checksum,
+            },
             &blocks,
             record_count,
             &BloomFilter::from_hashes(&bloom_hashes),
         )?;
-        w.write_all(&index_offset.to_be_bytes())?;
+        let index_offset_bytes = index_offset.to_be_bytes();
+        index_checksum.update(&index_offset_bytes);
+        w.write_all(&index_offset_bytes)?;
+        w.write_all(&index_checksum.finish().to_be_bytes())?;
         w.write_all(FOOTER_MAGIC)?;
         w.flush()?;
         w.get_ref().sync_all()?;
@@ -612,7 +674,12 @@ impl SsTable {
         let mut previous_table_key: Option<Vec<u8>> = None;
         for block in &self.blocks {
             file.seek(SeekFrom::Start(block.start))?;
-            let mut reader = BufReader::new((&mut file).take(block.end - block.start));
+            let mut checksum = Crc32::new();
+            let checked = ChecksummedReader {
+                inner: (&mut file).take(block.end - block.start),
+                checksum: &mut checksum,
+            };
+            let mut reader = BufReader::new(checked);
             let mut previous_key: Option<Vec<u8>> = None;
             let mut records_read = 0usize;
             while let Some((key, versions)) = read_record(&mut reader)? {
@@ -633,6 +700,10 @@ impl SsTable {
                     "SSTable block record count does not match index",
                 ));
             }
+            drop(reader);
+            if checksum.finish() != block.checksum {
+                return Err(invalid_data("SSTable block checksum mismatch"));
+            }
         }
 
         if entries.len() != self.len {
@@ -643,11 +714,7 @@ impl SsTable {
 
     /// Streams records in key order with at most one decoded record resident.
     pub(crate) fn iter(&self) -> io::Result<SsTableIter> {
-        SsTableIter::open(
-            &self.path,
-            self.len,
-            self.blocks.last().map(|block| block.end),
-        )
+        SsTableIter::open(&self.path, &self.blocks)
     }
 
     /// Reads every key in ascending order. This is intentionally a disk scan:
@@ -669,14 +736,16 @@ impl SsTable {
 
 pub(crate) struct SsTableIter {
     reader: BufReader<File>,
-    remaining: usize,
-    data_end: u64,
+    blocks: Vec<BlockIndex>,
+    block_pos: usize,
+    record_pos: usize,
+    block_checksum: Crc32,
     previous_key: Option<Vec<u8>>,
     failed: bool,
 }
 
 impl SsTableIter {
-    fn open(path: &Path, records: usize, data_end: Option<u64>) -> io::Result<Self> {
+    fn open(path: &Path, blocks: &[BlockIndex]) -> io::Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut magic = [0u8; FILE_MAGIC.len()];
         reader.read_exact(&mut magic)?;
@@ -685,38 +754,41 @@ impl SsTableIter {
         }
         Ok(Self {
             reader,
-            remaining: records,
-            data_end: data_end.unwrap_or(FILE_MAGIC.len() as u64),
+            blocks: blocks.to_vec(),
+            block_pos: 0,
+            record_pos: 0,
+            block_checksum: Crc32::new(),
             previous_key: None,
             failed: false,
         })
     }
 
     fn next_record(&mut self) -> io::Result<Option<(Vec<u8>, Vec<VersionedValue>)>> {
-        if self.remaining == 0 {
-            if self.reader.stream_position()? != self.data_end {
-                return Err(invalid_data("SSTable record count does not match index"));
-            }
+        let Some(block) = self.blocks.get(self.block_pos) else {
             return Ok(None);
-        }
+        };
 
-        let Some((key, versions)) = read_record(&mut self.reader)? else {
+        let record = read_record(&mut ChecksummedReader {
+            inner: &mut self.reader,
+            checksum: &mut self.block_checksum,
+        })?;
+        let Some((key, versions)) = record else {
             return Err(invalid_data(
                 "SSTable ended before its indexed record count",
             ));
         };
-        if self
-            .previous_key
-            .as_deref()
-            .is_some_and(|previous| previous >= key.as_slice())
-        {
-            return Err(invalid_data("SSTable keys are not strictly ordered"));
-        }
-        self.remaining -= 1;
-        if self.reader.stream_position()? > self.data_end
-            || (self.remaining == 0 && self.reader.stream_position()? != self.data_end)
-        {
-            return Err(invalid_data("SSTable record data exceeds indexed bounds"));
+        validate_block_record(block, &key, self.previous_key.as_deref(), self.record_pos)?;
+        self.record_pos += 1;
+        if self.record_pos == block.records {
+            if self.reader.stream_position()? != block.end {
+                return Err(invalid_data("SSTable record data exceeds indexed bounds"));
+            }
+            if self.block_checksum.finish() != block.checksum {
+                return Err(invalid_data("SSTable block checksum mismatch"));
+            }
+            self.block_pos += 1;
+            self.record_pos = 0;
+            self.block_checksum = Crc32::new();
         }
         self.previous_key = Some(key.clone());
         Ok(Some((key, versions)))
@@ -767,6 +839,7 @@ fn write_index<W: Write>(
         let count = u32::try_from(block.records)
             .map_err(|_| invalid_input("SSTable block has too many records"))?;
         w.write_all(&count.to_be_bytes())?;
+        w.write_all(&block.checksum.to_be_bytes())?;
     }
     Ok(())
 }
@@ -782,7 +855,10 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
 
     let footer_offset = file_len - FOOTER_LEN;
     file.seek(SeekFrom::Start(footer_offset))?;
-    let index_offset = read_u64(file)?;
+    let mut index_offset_bytes = [0u8; 8];
+    file.read_exact(&mut index_offset_bytes)?;
+    let index_offset = u64::from_be_bytes(index_offset_bytes);
+    let stored_index_checksum = read_u32(file)?;
     let mut actual_footer_magic = [0u8; FOOTER_MAGIC.len()];
     file.read_exact(&mut actual_footer_magic)?;
     if &actual_footer_magic != FOOTER_MAGIC {
@@ -793,7 +869,11 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
     }
 
     file.seek(SeekFrom::Start(index_offset))?;
-    let mut reader = file.take(footer_offset - index_offset);
+    let mut index_checksum = Crc32::new();
+    let mut reader = ChecksummedReader {
+        inner: file.take(footer_offset - index_offset),
+        checksum: &mut index_checksum,
+    };
     let mut actual_index_magic = [0u8; INDEX_MAGIC.len()];
     reader.read_exact(&mut actual_index_magic)?;
     if &actual_index_magic != INDEX_MAGIC {
@@ -816,9 +896,9 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
     let mut bits = vec![0; bloom_len as usize];
     reader.read_exact(&mut bits)?;
     let bloom = BloomFilter { bits, hashes };
-    // Even an empty-key index entry needs 24 bytes. Reject a corrupt count
+    // Even an empty-key index entry needs 28 bytes. Reject a corrupt count
     // before using it as a potentially enormous allocation capacity.
-    if block_count as u64 > reader.limit() / 24 {
+    if block_count as u64 > reader.limit() / 28 {
         return Err(invalid_data("SSTable block count exceeds index size"));
     }
     let mut blocks = Vec::with_capacity(block_count);
@@ -827,17 +907,24 @@ fn read_index(file: &mut File) -> io::Result<(Vec<BlockIndex>, BloomFilter, usiz
         let start = read_u64(&mut reader)?;
         let end = read_u64(&mut reader)?;
         let records = read_u32(&mut reader)? as usize;
+        let checksum = read_u32(&mut reader)?;
         blocks.push(BlockIndex {
             first_key,
             start,
             end,
             records,
+            checksum,
         });
     }
     if reader.limit() != 0 {
         return Err(invalid_data("unexpected bytes at end of SSTable index"));
     }
 
+    let _ = reader.into_inner();
+    index_checksum.update(&index_offset_bytes);
+    if index_checksum.finish() != stored_index_checksum {
+        return Err(invalid_data("SSTable index checksum mismatch"));
+    }
     validate_index(&blocks, record_count, index_offset)?;
     Ok((blocks, bloom, record_count))
 }
@@ -901,6 +988,7 @@ fn validate_block_record(
 }
 
 fn decode_block(block: &BlockIndex, bytes: &[u8]) -> io::Result<BlockEntries> {
+    verify_block_checksum(block, bytes)?;
     let mut reader = Cursor::new(bytes);
     let mut entries = Vec::with_capacity(block.records);
     let mut previous_key: Option<Vec<u8>> = None;
@@ -915,6 +1003,13 @@ fn decode_block(block: &BlockIndex, bytes: &[u8]) -> io::Result<BlockEntries> {
         ));
     }
     Ok(entries)
+}
+
+fn verify_block_checksum(block: &BlockIndex, bytes: &[u8]) -> io::Result<()> {
+    if crc32(&[bytes]) != block.checksum {
+        return Err(invalid_data("SSTable block checksum mismatch"));
+    }
+    Ok(())
 }
 
 fn find_version(
@@ -940,30 +1035,37 @@ fn scan_block_version(
     sequence: u64,
 ) -> io::Result<Option<VersionedValue>> {
     file.seek(SeekFrom::Start(block.start))?;
-    let mut reader = BufReader::new(file.take(block.end - block.start));
+    let mut checksum = Crc32::new();
+    let checked = ChecksummedReader {
+        inner: file.take(block.end - block.start),
+        checksum: &mut checksum,
+    };
+    let mut reader = BufReader::new(checked);
     let mut previous_key: Option<Vec<u8>> = None;
     let mut records_read = 0usize;
+    let mut found = None;
 
     while let Some((record_key, versions)) = read_record(&mut reader)? {
         validate_block_record(block, &record_key, previous_key.as_deref(), records_read)?;
         records_read += 1;
-        match record_key.as_slice().cmp(key) {
-            Ordering::Less => previous_key = Some(record_key),
-            Ordering::Equal => {
-                return Ok(versions
-                    .into_iter()
-                    .rev()
-                    .find(|version| version.sequence <= sequence));
-            }
-            Ordering::Greater => return Ok(None),
+        if record_key.as_slice() == key {
+            found = versions
+                .into_iter()
+                .rev()
+                .find(|version| version.sequence <= sequence);
         }
+        previous_key = Some(record_key);
     }
     if records_read != block.records {
         return Err(invalid_data(
             "SSTable block record count does not match index",
         ));
     }
-    Ok(None)
+    drop(reader);
+    if checksum.finish() != block.checksum {
+        return Err(invalid_data("SSTable block checksum mismatch"));
+    }
+    Ok(found)
 }
 
 fn decoded_block_charge(entries: &[(Vec<u8>, Vec<VersionedValue>)]) -> usize {
@@ -1152,7 +1254,7 @@ fn value_bytes(value: &Value) -> usize {
     }
 }
 
-fn read_index_key<R: Read>(r: &mut std::io::Take<R>) -> io::Result<Vec<u8>> {
+fn read_index_key<R: Read>(r: &mut ChecksummedReader<'_, std::io::Take<R>>) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as u64;
     if len > MAX_KEY_BYTES as u64 || len > r.limit() {
         return Err(invalid_data("SSTable index key exceeds index bounds"));
@@ -1425,6 +1527,88 @@ mod tests {
         assert_eq!(uncached.file_misses - before_uncached.file_misses, 2);
         assert_eq!(uncached.block_misses - before_uncached.block_misses, 2);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn data_block_checksum_detects_corruption_on_every_read_path() {
+        let path = tmp("block-checksum");
+        let entries: Vec<(Vec<u8>, Vec<VersionedValue>)> = (0..4)
+            .map(|i| {
+                (
+                    format!("key-{i}").into_bytes(),
+                    version(i + 1, Value::Set(format!("value-{i}").into_bytes())),
+                )
+            })
+            .collect();
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (key.as_slice(), versions.as_slice())),
+        )
+        .unwrap();
+
+        let sst = SsTable::open(&path).unwrap();
+        let corrupt_offset = sst.blocks[0].end - 1;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        let byte = read_u8(&mut file).unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        file.write_all(&[byte ^ 1]).unwrap();
+        drop(file);
+
+        let error = sst.get(b"key-0").unwrap_err();
+        assert!(error.to_string().contains("block checksum mismatch"));
+        sst.cache.configure(0, 0);
+        let error = sst.get(b"key-0").unwrap_err();
+        assert!(error.to_string().contains("block checksum mismatch"));
+        let error = sst.entries().unwrap_err();
+        assert!(error.to_string().contains("block checksum mismatch"));
+        let error = sst
+            .iter()
+            .unwrap()
+            .find_map(Result::err)
+            .expect("streaming iteration must detect block corruption");
+        assert!(error.to_string().contains("block checksum mismatch"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn index_checksum_detects_corruption_during_open() {
+        let path = tmp("index-checksum");
+        let entries = [(b"key".as_slice(), version(1, Value::Set(b"value".to_vec())))];
+        SsTable::write(
+            &path,
+            entries
+                .iter()
+                .map(|(key, versions)| (*key, versions.as_slice())),
+        )
+        .unwrap();
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let corrupt_offset = file_len - FOOTER_LEN - 1;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        let byte = read_u8(&mut file).unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        file.write_all(&[byte ^ 1]).unwrap();
+        drop(file);
+
+        let error = match SsTable::open(&path) {
+            Ok(_) => panic!("expected index checksum corruption to fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("index checksum mismatch"));
         std::fs::remove_file(&path).ok();
     }
 

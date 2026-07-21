@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use crate::checksum::{Crc32, crc32};
 use crate::limits::{MAX_BATCH_OPERATIONS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_WAL_RECORD_BYTES};
 use crate::sstable::{
     SsTable, SsTableCache, SsTableCacheMetrics, SsTableIter, Value, VersionedValue,
@@ -1561,9 +1562,34 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
     let mut manifest = Manifest::default();
     let mut saw_sequence = false;
     let mut saw_history_start = false;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    let mut saw_checksum = false;
+    let mut checksum = Crc32::new();
+    let mut reader = BufReader::new(file);
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        if reader.read_until(b'\n', &mut raw_line)? == 0 {
+            break;
+        }
+        if saw_checksum {
+            return Err(invalid_data("manifest checksum must be the final line"));
+        }
+        let line = std::str::from_utf8(&raw_line)
+            .map_err(|_| invalid_data("manifest is not valid UTF-8"))?;
         let trimmed = line.trim();
+        if let Some(encoded_checksum) = trimmed.strip_prefix("checksum=") {
+            if encoded_checksum.len() != 8 {
+                return Err(invalid_data("invalid manifest checksum"));
+            }
+            let stored_checksum = u32::from_str_radix(encoded_checksum, 16)
+                .map_err(|_| invalid_data("invalid manifest checksum"))?;
+            if checksum.finish() != stored_checksum {
+                return Err(invalid_data("manifest checksum mismatch"));
+            }
+            saw_checksum = true;
+            continue;
+        }
+        checksum.update(&raw_line);
         if trimmed.is_empty() {
             continue;
         }
@@ -1595,6 +1621,9 @@ fn read_manifest(path: &Path) -> io::Result<Manifest> {
         } else {
             manifest.sstables.push(trimmed.to_string());
         }
+    }
+    if !saw_checksum {
+        return Err(invalid_data("manifest is missing its checksum"));
     }
     if !saw_sequence {
         return Err(io::Error::new(
@@ -1630,14 +1659,25 @@ fn write_manifest(
     let tmp = PathBuf::from(tmp);
 
     let mut file = File::create(&tmp)?;
-    writeln!(file, "sequence={sequence}")?;
-    writeln!(file, "history_start={history_start}")?;
+    let mut checksum = Crc32::new();
+    let sequence_line = format!("sequence={sequence}\n");
+    write_manifest_bytes(&mut file, &mut checksum, sequence_line.as_bytes())?;
+    let history_line = format!("history_start={history_start}\n");
+    write_manifest_bytes(&mut file, &mut checksum, history_line.as_bytes())?;
     for name in names {
-        writeln!(file, "{name}")?;
+        write_manifest_bytes(&mut file, &mut checksum, name.as_bytes())?;
+        write_manifest_bytes(&mut file, &mut checksum, b"\n")?;
     }
+    writeln!(file, "checksum={:08x}", checksum.finish())?;
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
     sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn write_manifest_bytes(file: &mut File, checksum: &mut Crc32, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    checksum.update(bytes);
     Ok(())
 }
 
@@ -1967,20 +2007,6 @@ fn wal_frame_checksum(length_bytes: &[u8; 4], payload: &[u8]) -> u32 {
     crc32(&[WAL_FRAME_MAGIC, length_bytes, payload])
 }
 
-fn crc32(parts: &[&[u8]]) -> u32 {
-    let mut crc = u32::MAX;
-    for part in parts {
-        for &byte in *part {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = 0u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-    }
-    !crc
-}
-
 fn validate_wal_magic<R: BufRead>(reader: &mut R) -> io::Result<()> {
     let available = reader.fill_buf()?;
     let prefix_len = available.len().min(WAL_FRAME_MAGIC.len());
@@ -2177,15 +2203,5 @@ fn compaction_threshold_from_env() -> Option<usize> {
             Err(_) => Some(DEFAULT_COMPACTION_THRESHOLD),
         },
         Err(_) => Some(DEFAULT_COMPACTION_THRESHOLD),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::crc32;
-
-    #[test]
-    fn crc32_matches_ieee_reference_vector() {
-        assert_eq!(crc32(&[b"123456789"]), 0xcbf4_3926);
     }
 }
